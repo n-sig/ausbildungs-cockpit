@@ -1,0 +1,62 @@
+# Betriebssystem-Dateien
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Temporäre Dateien & Caches
+*.tmp
+*.bak
+*~
+.cache/
+
+# Private Schlüssel oder Umgebungsvariablen
+*.env
+*.pem
+*.key
+credentials.json
+secrets.txt
+
+# VS Code / IDE Caches
+.vscode/*
+!.vscode/settings.json
+
+# -------------------------------------------------------------------------
+# Laufzeit-Artefakte des Cockpits
+# -------------------------------------------------------------------------
+# Lokales Vollbackup (dropzone.html -> LOCAL_BACKUP_FILE). Enthält den
+# kompletten Planer-Zustand und gehört in den lokalen Ordner, nicht ins Repo.
+.cockpit_data.json
+
+# Cloud-Entwurf und Panic-Beacon. Beide enthalten deinen laufenden
+# Arbeitsstand im Klartext.
+#
+# Hinweis: Wer den GitHub-Entwurfs-Sync bewusst nutzen will, muss die erste
+# Zeile hier auskommentieren – dann landet der Entwurf im Repository. Das ist
+# nur sinnvoll, wenn dein Repository privat ist.
+01_Berichtsheft/.draft_active.json
+01_Berichtsheft/.draft_panic.json
+
+# -------------------------------------------------------------------------
+# Deine Inhalte
+# -------------------------------------------------------------------------
+# Das Template liefert die Struktur, nicht die Inhalte. Wer seine
+# Ausbildungsnachweise im Repository versionieren will – und das ist der
+# übliche Fall –, entfernt die folgenden Zeilen in der eigenen Instanz.
+#
+# Sie stehen hier, damit beim ersten Klon niemand versehentlich
+# Betriebsinterna committet, bevor er geprüft hat, dass sein Repository
+# privat ist.
+01_Berichtsheft/Ausbildungsjahr_*/*
+02_Berufsschule/*
+03_Betrieb_Notizen/*
+04_Assets_Screenshots/*
+05_Transfer_Inbox/*
+!*/README.md
+!*/.gitkeep
+!01_Berichtsheft/Ausbildungsjahr_1/DEMO_KW01_2026.md
+
+# Python (falls du eigene Server-Werkzeuge daneben legst)
+__pycache__/
+*.py[cod]
+.venv/
+venv/

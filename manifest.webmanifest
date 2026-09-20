@@ -1,0 +1,29 @@
+{
+  "name": "Ausbildungs-Cockpit",
+  "short_name": "Cockpit",
+  "description": "Autarkes Cockpit für Wochenplanung, Zeiterfassung und Berichtsheft-Export in der Ausbildung",
+  "start_url": "./dropzone.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0b0f17",
+  "theme_color": "#0b0f17",
+  "categories": [
+    "education",
+    "productivity",
+    "utilities"
+  ],
+  "icons": [
+    {
+      "src": "./app.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "./app.ico",
+      "sizes": "48x48 32x32 16x16",
+      "type": "image/x-icon"
+    }
+  ]
+}
