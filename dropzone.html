@@ -3479,6 +3479,10 @@
                 <svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" fill="none" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>
                 <span id="btnSaveWeekToGithubLabel">Woche archivieren</span>
               </button>
+              <button id="btnReloadFromArchive" class="btn btn-sm btn-ghost" style="display:none;" title="Inhalt frisch aus der archivierten Markdown-Datei im Repo laden" onclick="reloadCurrentWeekFromArchive();">
+                <svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" fill="none" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                Aus Archiv laden
+              </button>
               <button id="btnExportCopilot" class="btn btn-accent btn-sm" title="KI- & Berichtsheft-Kopiervorlage öffnen">
                 <svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
                 Copilot-Export
@@ -4781,6 +4785,8 @@
     let folderStatus = {};
     let currentPreview = null;           // FileRef der offenen Vorschau (+ .text)
     let cachedArchivedWeeks = new Set();
+    let cachedArchivedFilesMap = new Map();
+    let isLoadingArchivedWeek = false;
 
     // Safe Ops Session Caches
     let pendingUpload = { blob: null, defaultName: '', folderId: null };
@@ -7715,6 +7721,234 @@
       notify('info', 'Lokale Ordner-Verknüpfung getrennt.');
     }
 
+    // =========================================================================
+    // ZWEI-WEGE-STRASSE: MARKDOWN-IMPORTER & ARCHIV-LOADER
+    // Liest archivierte .md-Dateien (z. B. auf anderem Rechner erstellt oder
+    // aus DEMO-Dateien) zurueck in den interaktiven Wochenplaner.
+    // =========================================================================
+    function parseWeekMarkdown(mdText) {
+      if (!mdText || typeof mdText !== 'string') return null;
+
+      const weekData = {
+        days: { mo: [], di: [], mi: [], do: [], fr: [] },
+        dayTargets: { mo: 7.75, di: 7.75, mi: 7.75, do: 7.75, fr: 6.0 },
+        dayPresets: { mo: null, di: null, mi: null, do: null, fr: null },
+        notes: { mo: '', di: '', mi: '', do: '', fr: '' },
+        av: { title: '', notes: '' },
+        archived: true
+      };
+
+      const lines = mdText.split(/\r?\n/);
+      let currentDay = null;
+      let inNotes = false;
+      let inAv = false;
+      let idCounter = 1;
+
+      const dayMap = {
+        'montag': 'mo',
+        'dienstag': 'di',
+        'mittwoch': 'mi',
+        'donnerstag': 'do',
+        'freitag': 'fr'
+      };
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+
+        // Day Header: ## 💼 Montag – 29.12. (7.75 h / Soll: 7.75 h) [Schule]
+        const dayHeaderMatch = line.match(/^##\s+[^\w\s]*\s*(Montag|Dienstag|Mittwoch|Donnerstag|Freitag)\b.*?(?:\[([^\]]+)\])?\s*$/i);
+        if (dayHeaderMatch) {
+          currentDay = dayMap[dayHeaderMatch[1].toLowerCase()];
+          inNotes = false;
+          inAv = false;
+          if (dayHeaderMatch[2]) {
+            const p = dayHeaderMatch[2].toLowerCase();
+            if (['schule', 'urlaub', 'feiertag', 'krank'].includes(p)) {
+              weekData.dayPresets[currentDay] = p;
+            }
+          }
+          continue;
+        }
+
+        // Wöchentlicher Arbeitsvorgang Header: ## 📝 Wöchentlicher Arbeitsvorgang
+        if (line.match(/^##\s+.*?Wöchentlicher Arbeitsvorgang/i)) {
+          currentDay = null;
+          inNotes = false;
+          inAv = true;
+          continue;
+        }
+
+        // Andere H2-Abschnitte beenden den Tag / AV (z. B. ## ⏱️ Arbeitszeiterfassung)
+        if (line.match(/^##\s+/)) {
+          currentDay = null;
+          inNotes = false;
+          inAv = false;
+          continue;
+        }
+
+        // Innerhalb eines Wochentags
+        if (currentDay) {
+          // Notizblock Header: > [!note] Tages- & Vortragsnotizen
+          if (line.match(/^>\s*\[!note\]/i)) {
+            inNotes = true;
+            continue;
+          }
+
+          if (inNotes) {
+            if (line.startsWith('>')) {
+              const noteText = line.replace(/^>\s*(?:\*\s*)?/, '').trim();
+              if (noteText) {
+                weekData.notes[currentDay] = weekData.notes[currentDay]
+                  ? weekData.notes[currentDay] + '\n' + noteText
+                  : noteText;
+              }
+              continue;
+            } else {
+              inNotes = false;
+            }
+          }
+
+          // Aufgabe: * **4.0h** [Betrieb]: Text... oder * **4.0h**: Text...
+          const taskMatch = line.match(/^\*\s*\*\*([\d.,]+)\s*h\*\*(?:\s*\[([^\]]+)\])?:\s*(.+)/i);
+          if (taskMatch) {
+            const hours = parseFloat(taskMatch[1].replace(',', '.'));
+            const typeRaw = (taskMatch[2] || 'Betrieb').toLowerCase();
+            let type = 'betrieb';
+            let isPreset = false;
+
+            if (typeRaw.includes('schule')) type = 'schule';
+            else if (typeRaw.includes('urlaub')) { type = 'urlaub'; isPreset = true; }
+            else if (typeRaw.includes('feiertag')) { type = 'feiertag'; isPreset = true; }
+            else if (typeRaw.includes('krank')) { type = 'krank'; isPreset = true; }
+
+            weekData.days[currentDay].push({
+              id: Date.now() + (idCounter++),
+              type,
+              text: taskMatch[3].trim(),
+              hours: isNaN(hours) ? 1.0 : hours,
+              timeStr: '',
+              transferred: false,
+              isPreset
+            });
+            continue;
+          }
+        }
+
+        // Innerhalb des Wöchentlichen Arbeitsvorgangs (Fachbericht)
+        if (inAv) {
+          const titleMatch = line.match(/^\*\*Thema:\*\*\s*(.+)/i);
+          if (titleMatch) {
+            weekData.av.title = titleMatch[1].trim();
+            continue;
+          }
+          if (line.startsWith('---')) {
+            inAv = false;
+            continue;
+          }
+          const trimmed = line.trim();
+          if (trimmed && trimmed !== '*Keine Notizen erfasst.*') {
+            weekData.av.notes = weekData.av.notes
+              ? weekData.av.notes + '\n' + trimmed
+              : trimmed;
+          }
+        }
+      }
+
+      return weekData;
+    }
+
+    async function tryLoadArchivedWeek(kw, yr, force = false) {
+      const folder = getTrainingYearFolder(kw, yr);
+      const kwPad = String(kw).padStart(2, '0');
+      let mdContent = null;
+      let sourceName = '';
+
+      // 1. Aus gecachter Dateiliste (falls scanGithubWeeks bereits lief)
+      const cached = cachedArchivedFilesMap.get(`${yr}_${kw}`) || cachedArchivedFilesMap.get(kw);
+      if (cached) {
+        // Zuerst lokaler Server (blitzschnell, offline)
+        try {
+          const locRes = await fetch(`/${BERICHTSHEFT_ROOT}/${cached.folder}/${cached.filename}`);
+          if (locRes.ok) {
+            mdContent = await locRes.text();
+            sourceName = cached.filename;
+          }
+        } catch(e){}
+
+        // Falls lokal fehlschlug: ueber GitHub API
+        if (!mdContent && githubReady()) {
+          try {
+            const ghRes = await fetch(`https://api.github.com/repos/${cfg.repo}/contents/${cached.path}`, {
+              headers: { 'Authorization': `Bearer ${cfg.token}`, 'Accept': 'application/vnd.github.raw' }
+            });
+            if (ghRes.ok) {
+              mdContent = await ghRes.text();
+              sourceName = cached.filename;
+            }
+          } catch(e){}
+        }
+      }
+
+      // 2. Fallback: Namenskandidaten durchprobieren
+      if (!mdContent) {
+        const candidates = [
+          `KW${kwPad}_${yr}.md`,
+          `DEMO_KW${kwPad}_${yr}.md`,
+          `Woche_KW${kwPad}_${yr}.md`
+        ];
+        for (const name of candidates) {
+          const relPath = `${BERICHTSHEFT_ROOT}/${folder}/${name}`;
+          try {
+            const locRes = await fetch(`/${relPath}`);
+            if (locRes.ok) {
+              mdContent = await locRes.text();
+              sourceName = name;
+              break;
+            }
+          } catch(e){}
+
+          if (githubReady()) {
+            try {
+              const ghRes = await fetch(`https://api.github.com/repos/${cfg.repo}/contents/${relPath}`, {
+                headers: { 'Authorization': `Bearer ${cfg.token}`, 'Accept': 'application/vnd.github.raw' }
+              });
+              if (ghRes.ok) {
+                mdContent = await ghRes.text();
+                sourceName = name;
+                break;
+              }
+            } catch(e){}
+          }
+        }
+      }
+
+      if (mdContent) {
+        const parsed = parseWeekMarkdown(mdContent);
+        if (parsed) {
+          const key = getWeekStorageKey(kw, yr);
+          planner.weeks[key] = parsed;
+          savePlannerState();
+          return { success: true, filename: sourceName, data: parsed };
+        }
+      }
+      return { success: false };
+    }
+
+    async function reloadCurrentWeekFromArchive() {
+      const kw = planner.selectedKw;
+      const yr = planner.selectedYear || 2026;
+      notify('loading', `Lade KW ${kw} (${yr}) aus Archiv...`);
+      const res = await tryLoadArchivedWeek(kw, yr, true);
+      if (res && res.success) {
+        renderPlanner();
+        renderSidebarRadar();
+        notify('success', `KW ${kw} (${yr}) erfolgreich aus ${res.filename} geladen ✓`);
+      } else {
+        notify('warning', `Keine Archiv-Datei für KW ${kw} (${yr}) gefunden.`);
+      }
+    }
+    window.reloadCurrentWeekFromArchive = reloadCurrentWeekFromArchive;
+
     // 1-Week Markdown Generator (Obsidian Vault & Human-First)
     function generateWeekMarkdown(kw, yr = (planner.selectedYear || 2026)) {
       const data = getWeekData(kw, yr);
@@ -9245,6 +9479,7 @@ ${tagsList.join('\n')}
       const folders = ['Ausbildungsjahr_1', 'Ausbildungsjahr_2', 'Ausbildungsjahr_3'];
       try {
         const tempSet = new Set();
+        const tempFilesMap = new Map();
         await Promise.all(folders.map(async (folder) => {
           try {
             const res = await fetch(`https://api.github.com/repos/${cfg.repo}/contents/${BERICHTSHEFT_ROOT}/${folder}`, {
@@ -9258,20 +9493,24 @@ ${tagsList.join('\n')}
                   if (m) {
                     const kwNum = parseInt(m[1], 10);
                     tempSet.add(kwNum);
+                    let detectedYr = 2026;
                     if (m[2]) {
-                      tempSet.add(`${m[2]}_${kwNum}`);
+                      detectedYr = parseInt(m[2], 10);
+                      tempSet.add(`${detectedYr}_${kwNum}`);
                     } else {
                       if (folder === 'Ausbildungsjahr_1') {
-                        const yr = kwNum >= 36 ? 2026 : 2027;
-                        tempSet.add(`${yr}_${kwNum}`);
+                        detectedYr = kwNum >= 36 ? 2026 : 2027;
+                        tempSet.add(`${detectedYr}_${kwNum}`);
                       } else if (folder === 'Ausbildungsjahr_2') {
-                        const yr = kwNum >= 36 ? 2027 : 2028;
-                        tempSet.add(`${yr}_${kwNum}`);
+                        detectedYr = kwNum >= 36 ? 2027 : 2028;
+                        tempSet.add(`${detectedYr}_${kwNum}`);
                       } else if (folder === 'Ausbildungsjahr_3') {
-                        const yr = kwNum >= 36 ? 2028 : 2029;
-                        tempSet.add(`${yr}_${kwNum}`);
+                        detectedYr = kwNum >= 36 ? 2028 : 2029;
+                        tempSet.add(`${detectedYr}_${kwNum}`);
                       }
                     }
+                    tempFilesMap.set(`${detectedYr}_${kwNum}`, { folder, filename: f.name, path: f.path });
+                    tempFilesMap.set(kwNum, { folder, filename: f.name, path: f.path });
                   }
                 });
               }
@@ -9280,6 +9519,7 @@ ${tagsList.join('\n')}
         }));
         if (tempSet.size > 0 || cachedArchivedWeeks.size === 0) {
           cachedArchivedWeeks = tempSet;
+          cachedArchivedFilesMap = tempFilesMap;
         }
         lastScanGithubWeeksTime = Date.now();
       } catch(e){}
@@ -9728,9 +9968,31 @@ ${tagsList.join('\n')}
     function renderPlanner() {
       const kw = planner.selectedKw;
       const yr = planner.selectedYear || 2026;
-      const data = getWeekData(kw, yr);
+      let data = getWeekData(kw, yr);
       const dates = getKwDates(kw, yr);
       const weekInfo = getTrainingWeekInfo(kw, yr);
+
+      // Zwei-Wege-Straße: Wenn im lokalen Speicher noch keine Aufgaben liegen,
+      // aber die Woche archiviert ist -> automatisch aus Markdown-Datei laden!
+      const hasWork = Object.values(data.days).some(arr => arr.length > 0) || !!data.av?.title || Object.values(data.notes || {}).some(n => n && n.trim().length > 0);
+      const isArchived = cachedArchivedWeeks.has(`${yr}_${kw}`) || (yr === 2026 && cachedArchivedWeeks.has(kw)) || data.archived;
+
+      if (!hasWork && isArchived && !isLoadingArchivedWeek) {
+        isLoadingArchivedWeek = true;
+        tryLoadArchivedWeek(kw, yr).then(res => {
+          isLoadingArchivedWeek = false;
+          if (res && res.success) {
+            renderPlanner();
+            renderSidebarRadar();
+            notify('info', `KW ${kw} (${yr}) automatisch aus Archiv-Datei (${res.filename}) geladen ✓`);
+          }
+        }).catch(() => { isLoadingArchivedWeek = false; });
+      }
+
+      const btnReload = document.getElementById('btnReloadFromArchive');
+      if (btnReload) {
+        btnReload.style.display = isArchived ? 'inline-flex' : 'none';
+      }
 
       updateRadarYearPillsUI();
 
