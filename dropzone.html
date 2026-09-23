@@ -6020,11 +6020,11 @@
               delete incoming.repo;
             }
             cfg = { ...cfg, ...incoming };
-            localStorage.setItem(KEY_CFG, JSON.stringify(cfg));
+            safeLocalSet(KEY_CFG, JSON.stringify(cfg));
           }
           if (imported.worktime) {
             worktime = { ...worktime, ...sanitizeWorktime(imported.worktime) };
-            localStorage.setItem(KEY_WORKTIME, JSON.stringify(worktime));
+            safeLocalSet(KEY_WORKTIME, JSON.stringify(worktime));
           }
           if (imported.planner) {
             const clean = sanitizePlanner(imported.planner);
@@ -6034,11 +6034,11 @@
               weeks: clean.weeks
             };
             if (clean.conflicts) planner.conflicts = clean.conflicts;
-            localStorage.setItem(KEY_PLANNER, JSON.stringify(planner));
+            safeLocalSet(KEY_PLANNER, JSON.stringify(planner));
           }
           if (imported.ihkProgress) {
             ihkProgress = { ...ihkProgress, ...sanitizeIhk(imported.ihkProgress) };
-            localStorage.setItem(KEY_IHK, JSON.stringify(ihkProgress));
+            safeLocalSet(KEY_IHK, JSON.stringify(ihkProgress));
           }
 
           loadSettings();
@@ -6054,10 +6054,10 @@
             worktime = previousBackup.worktime;
             planner = previousBackup.planner;
             ihkProgress = previousBackup.ihkProgress;
-            localStorage.setItem(KEY_CFG, JSON.stringify(cfg));
-            localStorage.setItem(KEY_WORKTIME, JSON.stringify(worktime));
-            localStorage.setItem(KEY_PLANNER, JSON.stringify(planner));
-            localStorage.setItem(KEY_IHK, JSON.stringify(ihkProgress));
+            safeLocalSet(KEY_CFG, JSON.stringify(cfg));
+            safeLocalSet(KEY_WORKTIME, JSON.stringify(worktime));
+            safeLocalSet(KEY_PLANNER, JSON.stringify(planner));
+            safeLocalSet(KEY_IHK, JSON.stringify(ihkProgress));
             loadSettings();
             initWorktime();
             renderPlanner();
@@ -7727,7 +7727,7 @@
           card.classList.add('collapsed');
         }
       }
-      localStorage.setItem('cockpit_show_fachbericht', show ? '1' : '0');
+      safeLocalSet('cockpit_show_fachbericht', show ? '1' : '0');
     }
     window.toggleFachberichtView = toggleFachberichtView;
 
@@ -8155,9 +8155,28 @@
         if (!handle) return;
         await saveLocalDirHandle(handle);
         cfg.onedriveFolderName = handle.name || 'OneDrive-Ordner';
-        localStorage.setItem(KEY_CFG, JSON.stringify(cfg));
+        safeLocalSet(KEY_CFG, JSON.stringify(cfg));
         updateOnedriveSettingsUI(handle.name);
         notify('success', html`Ordner <strong>${handle.name}</strong> erfolgreich verknüpft!`);
+
+        // Erst nachsehen, was im Ordner liegt - nach einem Browser-Wipe ist
+        // das oft die einzige vollstaendige Kopie. Frueher wurde hier sofort
+        // die (leere) aktuelle Woche darueber geschrieben.
+        const diskSnap = await readLocalDataBackup();
+        const diskCount = countFilledWeeks(diskSnap && diskSnap.planner && diskSnap.planner.weeks);
+        const localCount = countFilledWeeks(planner.weeks);
+        if (diskCount > 0 && localCount === 0) {
+          const stamp = diskSnap.savedAt ? new Date(diskSnap.savedAt).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'unbekannt';
+          if (confirm(`Im Ordner liegt eine Sicherung (${LOCAL_BACKUP_FILE}) vom ${stamp} mit ${diskCount} Wochen.\nDer Browser enthält keine Wochen.\n\nJetzt wiederherstellen?`)) {
+            applyStateSnapshot(diskSnap, { rerender: true, restoreToken: false });
+            await restoreAuthFromIdb();
+            diskBackupRev = draftRev;
+            showRecoveryBanner('<strong>Aus dem Ordner wiederhergestellt.</strong> ' + diskCount + ' Wochen aus ' + LOCAL_BACKUP_FILE + ' (Stand: ' + escapeHtml(stamp) + ').');
+          }
+        } else if (diskCount > localCount) {
+          notify('warning', `Die Sicherung im Ordner enthält mehr Wochen (${diskCount}) als der Browser (${localCount}).`,
+            () => restoreLocalStateManually(), 'Vergleichen & wiederherstellen');
+        }
 
         const kw = planner.selectedKw;
         const yr = planner.selectedYear || defaultPlannerYear();
@@ -8176,7 +8195,7 @@
     async function disconnectOnedriveFolder() {
       await clearLocalDirHandle();
       cfg.onedriveFolderName = '';
-      localStorage.setItem(KEY_CFG, JSON.stringify(cfg));
+      safeLocalSet(KEY_CFG, JSON.stringify(cfg));
       updateOnedriveSettingsUI('');
       notify('info', 'Lokale Ordner-Verknüpfung getrennt.');
     }
@@ -8773,6 +8792,10 @@ ${tagsList.join('\n')}
     // Write single week markdown to local OneDrive / Obsidian directory
     async function writeMarkdownToLocalDir(kw, yr, mdContent) {
       if (!window.showDirectoryPicker) return false;
+      // Eine leere Woche wird nie geschrieben: sie wuerde eine vorhandene,
+      // gefuellte KW-Datei leeren - genau das passierte beim erneuten
+      // Verknuepfen des Ordners nach einem Browser-Wipe.
+      if (isEmptyWeek(planner.weeks[getWeekStorageKey(kw, yr)])) return false;
       // Serialisiert: nie zwei offene Writables auf denselben Handle.
       return queueFsWrite(async () => {
         try {
@@ -8904,14 +8927,44 @@ ${tagsList.join('\n')}
     let isSnapshotWriting = false;
     let lastSnapHistoryWrite = 0;
     const SNAP_HISTORY_INTERVAL_MS = 5 * 60 * 1000; // Wiederherstellungspunkt alle 5 Min.
+    const SNAP_DAY_LIMIT = 14;                          // Tagespunkte
+    let lastHistoryFp = null;
+
+    function localDateStr(d) {
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    }
+
+    // Inhalt, nicht Anzeige: Wochenwahl, Zeitstempel usw. zaehlen nicht.
+    function snapshotFingerprint(snap) {
+      if (!snap) return null;
+      return hashStr(stableStringify({
+        weeks: (snap.planner && snap.planner.weeks) || {},
+        conflicts: (snap.planner && snap.planner.conflicts) || {},
+        worktime: snap.worktime || {},
+        ihk: snap.ihkProgress || {},
+        cfg: syncedCfgSubset(snap.cfg || {})
+      }));
+    }
+
+    function countFilledWeeks(weeks) {
+      return Object.values(weeks || {}).filter(w => w && typeof w === 'object' && !isEmptyWeek(w)).length;
+    }
 
     // --- 1. IndexedDB: cockpit_db_v2 -> snapshots ---
+    // Eine Verbindung fuer die ganze Sitzung statt open/close bei jedem
+    // Schreibvorgang. Die Aufrufer rufen weiterhin db.close() - das ist an
+    // dieser Instanz bewusst ein No-op. Wirklich geschlossen wird nur, wenn
+    // eine neue DB-Version oder deleteDatabase() es verlangt (versionchange),
+    // oder der Browser die Verbindung kappt; der naechste Aufruf oeffnet neu.
+    let snapshotDbPromise = null;
     function openSnapshotDb() {
-      return new Promise((resolve, reject) => {
+      if (snapshotDbPromise) return snapshotDbPromise;
+      snapshotDbPromise = new Promise((resolve, reject) => {
         let req;
         try {
           req = indexedDB.open(DB_SNAP_NAME, 1);
         } catch(e) {
+          snapshotDbPromise = null;
           reject(e);
           return;
         }
@@ -8921,10 +8974,17 @@ ${tagsList.join('\n')}
             db.createObjectStore(DB_SNAP_STORE);
           }
         };
-        req.onsuccess = () => resolve(req.result);
-        req.onerror = () => reject(req.error);
-        req.onblocked = () => reject(new Error('IndexedDB blockiert'));
+        req.onsuccess = () => {
+          const db = req.result;
+          db.close = () => {};
+          db.onversionchange = () => { IDBDatabase.prototype.close.call(db); snapshotDbPromise = null; };
+          db.onclose = () => { snapshotDbPromise = null; };
+          resolve(db);
+        };
+        req.onerror = () => { snapshotDbPromise = null; reject(req.error); };
+        req.onblocked = () => { snapshotDbPromise = null; reject(new Error('IndexedDB blockiert')); };
       });
+      return snapshotDbPromise;
     }
 
     function idbPut(db, key, value) {
@@ -9146,18 +9206,35 @@ ${tagsList.join('\n')}
           lastAuthWritten = cfg.token;
         }
 
-        // Zusaetzlich gedrosselte Wiederherstellungspunkte, damit die Historie
-        // nicht bei jedem Tastendruck durchrotiert.
+        // Zusaetzlich gedrosselte Wiederherstellungspunkte - aber nur, wenn
+        // sich der Inhalt seit dem letzten Punkt geaendert hat. Sonst fuellen
+        // 20 identische Punkte die Historie, und der Stand von gestern ist
+        // nach 100 Minuten offenem Tab verschwunden. Dazu je Kalendertag ein
+        // Punkt ('day_JJJJ-MM-TT', letzter Stand des Tages, 14 Tage).
         const now = Date.now();
         if (now - lastSnapHistoryWrite >= SNAP_HISTORY_INTERVAL_MS) {
           lastSnapHistoryWrite = now;
-          await idbPut(db, 'snap_' + now, snap);
+          const fp = snapshotFingerprint(snap);
+          const allKeys = (await idbKeys(db)).filter(k => typeof k === 'string');
+          const hist = allKeys.filter(k => k.startsWith('snap_')).sort();
+          if (lastHistoryFp === null && hist.length) {
+            const newest = await idbGet(db, hist[hist.length - 1]);
+            lastHistoryFp = newest ? (newest._fp || snapshotFingerprint(newest)) : null;
+          }
+          if (fp !== lastHistoryFp) {
+            const point = Object.assign({}, snap, { _fp: fp });
+            await idbPut(db, 'snap_' + now, point);
+            await idbPut(db, 'day_' + localDateStr(new Date()), point);
+            lastHistoryFp = fp;
 
-          // Rollierende Historie kappen
-          const keys = (await idbKeys(db)).filter(k => typeof k === 'string' && k.startsWith('snap_')).sort();
-          if (keys.length > SNAP_HISTORY_LIMIT) {
-            for (const k of keys.slice(0, keys.length - SNAP_HISTORY_LIMIT)) {
-              await idbDelete(db, k);
+            // Rollierende Historie kappen
+            hist.push('snap_' + now);
+            if (hist.length > SNAP_HISTORY_LIMIT) {
+              for (const k of hist.slice(0, hist.length - SNAP_HISTORY_LIMIT)) await idbDelete(db, k);
+            }
+            const days = [...new Set(allKeys.filter(k => k.startsWith('day_')).concat('day_' + localDateStr(new Date())))].sort();
+            if (days.length > SNAP_DAY_LIMIT) {
+              for (const k of days.slice(0, days.length - SNAP_DAY_LIMIT)) await idbDelete(db, k);
             }
           }
         }
@@ -9191,6 +9268,22 @@ ${tagsList.join('\n')}
     }
 
     // --- 4. Lokales Vollbackup auf Festplatte: .cockpit_data.json ---
+    // Frueher nur per Knopfdruck - die Auto-Recovery griff damit auf eine
+    // Datei zu, die meist nie oder vor Wochen geschrieben worden war. Jetzt
+    // schreibt die Pipeline sie mit (hoechstens 1x pro Minute, beim
+    // Verstecken/Schliessen sofort), sobald sich seit dem letzten Mal etwas
+    // geaendert hat.
+    let lastDiskBackupAt = 0;
+    let diskBackupRev = -1;
+    let diskBackupShrinkWarned = false;
+    const DISK_BACKUP_MIN_INTERVAL_MS = 60 * 1000;
+
+    async function maybeWriteDiskBackup(force = false) {
+      if (cfg.autoSyncOnedrive === false || !cfg.onedriveFolderName || !window.showDirectoryPicker) return false;
+      if (diskBackupRev === draftRev) return false;   // nichts Neues
+      if (!force && Date.now() - lastDiskBackupAt < DISK_BACKUP_MIN_INTERVAL_MS) return false;
+      return writeLocalDataBackup(true);
+    }
     // Hinweis: Der GitHub-PAT wird bewusst NICHT auf die Platte geschrieben,
     // damit kein Token in einen synchronisierten OneDrive-Ordner gelangt.
     async function writeLocalDataBackup(silent = true) {
@@ -9210,10 +9303,38 @@ ${tagsList.join('\n')}
           return false;
         }
 
+        // Die Datei im Ordner ist nach einem GPO-Wipe oft die EINZIGE
+        // vollstaendige Kopie. Ein leerer oder deutlich kleinerer Browser-
+        // Stand darf sie deshalb nie automatisch ueberschreiben.
+        const localCount = countFilledWeeks(planner.weeks);
+        let diskCount = 0;
+        try {
+          const existingHandle = await rootHandle.getFileHandle(LOCAL_BACKUP_FILE, { create: false });
+          const existing = JSON.parse(await (await existingHandle.getFile()).text());
+          diskCount = countFilledWeeks(existing && existing.planner && existing.planner.weeks);
+        } catch(e) { /* keine oder unlesbare Datei */ }
+        const shrinks = diskCount > 0 && (localCount === 0 || localCount < diskCount * 0.8);
+        if (shrinks) {
+          if (silent) {
+            if (!diskBackupShrinkWarned) {
+              diskBackupShrinkWarned = true;
+              notify('warning', `${LOCAL_BACKUP_FILE} im Ordner enthält ${diskCount} Wochen, der Browser nur ${localCount} – nicht automatisch überschrieben.`,
+                () => restoreLocalStateManually(), 'Vergleichen & wiederherstellen');
+            }
+            return false;
+          }
+          if (!confirm(`${LOCAL_BACKUP_FILE} im Ordner enthält ${diskCount} Wochen mit Inhalt, der Browser nur ${localCount}.\n\nTrotzdem mit dem Browser-Stand überschreiben?`)) {
+            notify('warning', 'Vollbackup abgebrochen – die Datei im Ordner ist unverändert.');
+            return false;
+          }
+        }
+
         const payload = buildStateSnapshot();
         const fileHandle = await rootHandle.getFileHandle(LOCAL_BACKUP_FILE, { create: true });
         const writable = await fileHandle.createWritable();
         await writable.write(JSON.stringify(payload, null, 2));
+        diskBackupRev = draftRev;
+        lastDiskBackupAt = Date.now();
         await writable.close();
         lastLocalSaveTime = new Date();
         if (!silent) {
@@ -9618,7 +9739,7 @@ ${tagsList.join('\n')}
     function schedulePersistence(delayMs = 1500) {
       draftRev++;
       const nowIso = new Date().toISOString();
-      localStorage.setItem(KEY_DRAFT_UPDATED, nowIso);
+      try { localStorage.setItem(KEY_DRAFT_UPDATED, nowIso); } catch(e) {}
 
       // 1) Sofortiges UI-Feedback
       if (cfg.githubDraftAutoSync !== true) {
@@ -9657,6 +9778,7 @@ ${tagsList.join('\n')}
             const yr = planner.selectedYear || defaultPlannerYear();
             const md = generateWeekMarkdown(kw, yr);
             await writeMarkdownToLocalDir(kw, yr, md);
+            await maybeWriteDiskBackup(false);
           } catch(e) {
             console.warn('[Persistence] Markdown write error:', e);
           }
@@ -10334,13 +10456,32 @@ ${tagsList.join('\n')}
     }
 
     // 8. Save State Wrappers (Local-First: LocalStorage -> IndexedDB -> Festplatte)
+    // localStorage kann voll sein (QuotaExceededError). Frueher warf der
+    // Aufruf dann, BEVOR schedulePersistence() lief - die IndexedDB, die viel
+    // mehr Platz hat, bekam die Aenderung damit auch nicht. Jetzt: Fehler
+    // einmal melden, die Pipeline laeuft trotzdem.
+    let localStorageFullWarned = false;
+    function safeLocalSet(key, value) {
+      try {
+        localStorage.setItem(key, value);
+        return true;
+      } catch(e) {
+        console.warn('[Persistence] localStorage-Schreibfehler (' + key + '):', e);
+        if (!localStorageFullWarned) {
+          localStorageFullWarned = true;
+          notify('error', 'Browser-Speicher (localStorage) ist voll oder gesperrt. Änderungen werden weiter in der IndexedDB gesichert – bitte ein Vollbackup exportieren.');
+        }
+        return false;
+      }
+    }
+
     function savePlannerState() {
-      localStorage.setItem(KEY_PLANNER, JSON.stringify(planner));
+      safeLocalSet(KEY_PLANNER, JSON.stringify(planner));
       schedulePersistence(1500);
     }
 
     function saveWorktimeState() {
-      localStorage.setItem(KEY_WORKTIME, JSON.stringify(worktime));
+      safeLocalSet(KEY_WORKTIME, JSON.stringify(worktime));
       schedulePersistence(1500);
     }
 
@@ -10407,8 +10548,10 @@ ${tagsList.join('\n')}
         // Stufe A: IndexedDB Snapshot (GPO-Schutz)
         try { await persistLocalStateNow(); } catch(e) { console.warn('[Persistence] IDB:', e); }
 
-        // Stufe B: Festplatte (aktive KW als Markdown)
+        // Stufe B: Festplatte (aktive KW als Markdown + Vollbackup, ungedrosselt:
+        // wer die Seite verlaesst, soll nicht die letzte Minute verlieren)
         try { await flushMarkdownWriteNow(); } catch(e) { console.warn('[Persistence] Markdown:', e); }
+        try { await maybeWriteDiskBackup(true); } catch(e) { console.warn('[Persistence] Vollbackup:', e); }
 
         // Stufe C: GitHub Cloud-Entwurf (nur bei Auto-Sync und ungespeicherter Arbeit)
         if (cfg.githubDraftAutoSync === true && cfg.token && hasUnsavedUserWork() && !isCloudDraftSyncing) {
@@ -12898,7 +13041,7 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
     function toggleTheme() {
       const cur = document.documentElement.getAttribute('data-theme') || 'dark';
       const next = cur === 'dark' ? 'light' : 'dark';
-      localStorage.setItem(KEY_THEME, next);
+      safeLocalSet(KEY_THEME, next);
       applyThemeUI(next);
       // Kein Toast: der Design-Wechsel ist sofort sichtbar.
     }
