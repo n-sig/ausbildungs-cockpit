@@ -2,6 +2,14 @@
 <html lang="de">
 <head>
   <meta charset="UTF-8">
+  <!--
+    Content-Security-Policy: zweite Verteidigungslinie. Selbst wenn je ein
+    XSS durchkaeme, darf die Seite nur mit sich selbst und api.github.com
+    sprechen - ein ausgelesenes Token laesst sich nicht per fetch/Bild an
+    einen fremden Server schicken. 'unsafe-inline' ist noetig, solange die
+    Oberflaeche inline-Handler (onclick=...) nutzt.
+  -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https://api.github.com https://raw.githubusercontent.com; frame-src blob:; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Ausbildungs-Cockpit</title>
   
@@ -4815,7 +4823,236 @@
     }
 
     function escapeHtml(str) {
-      return (str || '').replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+      return String(str === undefined || str === null ? '' : str)
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    }
+
+    // Tagged Template fuer Toasts mit Auszeichnung: jeder eingesetzte Wert
+    // wird escaped, nur das Geruest im Quelltext bleibt HTML.
+    //   notify('success', html`Datei <strong>${name}</strong> gespeichert`)
+    // Ohne html`` setzt notify() reinen Text - ein Dateiname aus dem Repo
+    // kann so nie mehr als Markup ausgefuehrt werden.
+    function html(strings, ...vals) {
+      let out = '';
+      strings.forEach((s, i) => { out += s + (i < vals.length ? escapeHtml(vals[i]) : ''); });
+      return { __html: out };
+    }
+
+    // Wert als Argument in einem inline-Handler (onclick="fn(${jsArg(x)})"):
+    // erst JSON (JS-String sicher), dann HTML-escaped - der Browser dekodiert
+    // Entities im Attribut, BEVOR er den Handler als JS parst. escapeHtml
+    // allein wuerde dort ein ' wieder zu einem echten Apostroph machen.
+    function jsArg(v) { return escapeHtml(JSON.stringify(v === undefined ? null : v)); }
+
+    // =======================================================================
+    // SCHEMA-BEREINIGUNG AN ALLEN EINGAENGEN
+    // localStorage, IndexedDB-Snapshot, .cockpit_data.json, Backup-Import,
+    // Cloud-Entwurf und Markdown-Import laufen hier durch, bevor irgendetwas
+    // davon gerendert wird. Unbekannte Felder fallen weg, Typen werden
+    // erzwungen - eine task.id wie '1"><img onerror=...>' kommt nie im DOM an.
+    // =======================================================================
+    const TASK_TYPES = ['betrieb', 'schule', 'urlaub', 'feiertag', 'krank'];
+    const DAY_KEYS = ['mo', 'di', 'mi', 'do', 'fr'];
+    const TIME_RE = /^\d{1,2}:\d{2}$/;
+    let sanitizeIdSeq = 0;
+
+    function clampNum(v, min, max, fallback) {
+      const n = Number(v);
+      return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+    }
+    function strOr(v, max, fallback = '') {
+      return (typeof v === 'string') ? v.slice(0, max) : fallback;
+    }
+
+    function sanitizeTask(t, usedIds) {
+      if (!t || typeof t !== 'object') return null;
+      let id = Number(t.id);
+      if (!Number.isFinite(id) || usedIds.has(id)) id = Date.now() * 1000 + (++sanitizeIdSeq);
+      usedIds.add(id);
+      const out = {
+        id,
+        type: TASK_TYPES.includes(t.type) ? t.type : 'betrieb',
+        text: strOr(t.text, 2000),
+        hours: clampNum(t.hours, 0, 24, 1),
+        timeStr: (typeof t.timeStr === 'string' && TIME_RE.test(t.timeStr)) ? t.timeStr : '',
+        transferred: !!t.transferred
+      };
+      if (t.transferredAt) out.transferredAt = strOr(t.transferredAt, 40, null);
+      if (t.isPreset) out.isPreset = true;
+      return out;
+    }
+
+    function sanitizeWeek(w) {
+      if (!w || typeof w !== 'object' || Array.isArray(w)) return null;
+      const defT = templateDayTargets();
+      const out = { days: {}, dayTargets: {}, dayPresets: {}, notes: {}, av: { title: '', notes: '' }, archived: !!w.archived };
+      DAY_KEYS.forEach(d => {
+        const used = new Set();
+        const src = (w.days && Array.isArray(w.days[d])) ? w.days[d] : [];
+        out.days[d] = src.map(t => sanitizeTask(t, used)).filter(Boolean);
+        out.dayTargets[d] = clampNum(w.dayTargets && w.dayTargets[d], 0, 24, defT[d]);
+        const p = w.dayPresets && w.dayPresets[d];
+        out.dayPresets[d] = (typeof p === 'string' && PRESET_CONFIG[p]) ? p : null;
+        out.notes[d] = strOr(w.notes && w.notes[d], 20000);
+      });
+      if (w.av && typeof w.av === 'object') {
+        out.av.title = strOr(w.av.title, 500);
+        out.av.notes = strOr(w.av.notes, 20000);
+      }
+      ['_sha', '_filename', '_source', '_loadedAt', '_syncedAt'].forEach(k => {
+        if (typeof w[k] === 'string') out[k] = w[k].slice(0, 160);
+      });
+      return out;
+    }
+
+    // Wochenschluessel: 'JJJJ_KW'. Nackte Zahlen stammen aus der Zeit, als
+    // Wochen von 2026 ohne Jahr gespeichert wurden - sie werden dorthin
+    // umgeschrieben.
+    function normalizeWeekKey(k) {
+      const s = String(k);
+      let m = /^(\d{4})_(\d{1,2})$/.exec(s);
+      if (m) return `${+m[1]}_${+m[2]}`;
+      m = /^(\d{1,2})$/.exec(s);
+      if (m) return `2026_${+m[1]}`;
+      return null;
+    }
+
+    function sanitizeWeeksMap(weeks, collisions) {
+      const out = {};
+      if (!weeks || typeof weeks !== 'object') return out;
+      // Zwei Durchgaenge: JavaScript zaehlt ganzzahlige Schluessel ('41')
+      // IMMER zuerst auf. Ohne Trennung gewaenne der Altschluessel gegen
+      // '2026_41'. Kanonisch zuerst; ein Altschluessel fuellt nur Luecken
+      // oder ersetzt eine leere kanonische Woche.
+      const keys = Object.keys(weeks);
+      const canonical = keys.filter(k => /^\d{4}_\d{1,2}$/.test(k));
+      const legacy = keys.filter(k => !/^\d{4}_\d{1,2}$/.test(k));
+      canonical.concat(legacy).forEach(k => {
+        const key = normalizeWeekKey(k);
+        const w = key && sanitizeWeek(weeks[k]);
+        if (!w) return;
+        if (!out[key] || (isEmptyWeek(out[key]) && !isEmptyWeek(w))) {
+          out[key] = w;
+        } else if (!isEmptyWeek(w) && collisions) {
+          // Beide gefuellt: nichts verwerfen - die Altfassung wird als
+          // Konfliktkopie angeboten (Leiste im Planer).
+          collisions[key] = w;
+        }
+      });
+      return out;
+    }
+
+    function sanitizePlanner(p) {
+      const src = (p && typeof p === 'object') ? p : {};
+      const collisions = {};
+      const out = {
+        selectedKw: Math.round(clampNum(src.selectedKw, 1, 53, getCalendarWeek())),
+        selectedYear: Math.round(clampNum(src.selectedYear, 2000, 2100, 0)) || undefined,
+        weeks: sanitizeWeeksMap(src.weeks, collisions)
+      };
+      const c = {};
+      Object.keys(collisions).forEach(key => {
+        c[key] = { remote: collisions[key], at: new Date().toISOString() };
+      });
+      if (Object.keys(c).length) out.conflicts = c;
+      if (src.conflicts && typeof src.conflicts === 'object') {
+        Object.keys(src.conflicts).forEach(k => {
+          const key = normalizeWeekKey(k);
+          const e = src.conflicts[k];
+          const remote = key && e && sanitizeWeek(e.remote);
+          if (remote) c[key] = { remote, at: strOr(e.at, 40, new Date().toISOString()) };
+        });
+        if (Object.keys(c).length) out.conflicts = c;
+      }
+      return out;
+    }
+
+    function sanitizeWorkRow(r, d) {
+      if (!r || typeof r !== 'object') return null;
+      const def = { start: '07:00', end: d === 'fr' ? '13:15' : '15:30', pause: d === 'fr' ? 15 : 45, target: d === 'fr' ? 6.0 : 7.75 };
+      const out = {
+        start: (typeof r.start === 'string' && TIME_RE.test(r.start)) ? r.start : def.start,
+        end: (typeof r.end === 'string' && TIME_RE.test(r.end)) ? r.end : def.end,
+        pause: Math.round(clampNum(r.pause, 0, 240, def.pause)),
+        target: clampNum(r.target, 0, 16, def.target)
+      };
+      if (r.edited) out.edited = true;
+      return out;
+    }
+
+    // Arbeitszeit-Wochen: einheitlich 'JJJJ_KWn'. Aeltere Pfade schrieben
+    // auch 'JJJJ_n' oder nur 'n' (2026) - die werden hierher verschoben.
+    function normalizeWorktimeKey(k) {
+      const s = String(k);
+      let m = /^(\d{4})_KW(\d{1,2})$/i.exec(s);
+      if (m) return `${+m[1]}_KW${+m[2]}`;
+      m = /^(\d{4})_(\d{1,2})$/.exec(s);
+      if (m) return `${+m[1]}_KW${+m[2]}`;
+      m = /^(\d{1,2})$/.exec(s);
+      if (m) return `2026_KW${+m[1]}`;
+      return null;
+    }
+
+    function sanitizeWorktime(w) {
+      const src = (w && typeof w === 'object') ? w : {};
+      const out = {};
+      if (typeof src.start === 'string' && TIME_RE.test(src.start)) out.start = src.start;
+      if (['mo_do_775', 'freitag_6', 'mo_do_8', 'freitag_5', 'custom'].includes(src.dayType)) out.dayType = src.dayType;
+      if (src.customHours !== undefined) out.customHours = clampNum(src.customHours, 0, 16, 7.75);
+      if (src.weekLog && typeof src.weekLog === 'object') {
+        out.weekLog = {};
+        DAY_KEYS.forEach(d => { const r = sanitizeWorkRow(src.weekLog[d], d); if (r) { delete r.edited; out.weekLog[d] = r; } });
+      }
+      if (src.weeks && typeof src.weeks === 'object') {
+        out.weeks = {};
+        Object.keys(src.weeks).forEach(k => {
+          const key = normalizeWorktimeKey(k);
+          const wk = src.weeks[k];
+          if (!key || !wk || typeof wk !== 'object') return;
+          const rows = {};
+          DAY_KEYS.forEach(d => { const r = sanitizeWorkRow(wk[d], d); if (r) rows[d] = r; });
+          if (!Object.keys(rows).length) return;
+          // Das kanonische Format schlaegt einen verschobenen Altschluessel
+          const isCanonical = /^\d{4}_KW\d{1,2}$/i.test(String(k));
+          if (!out.weeks[key] || isCanonical) out.weeks[key] = Object.assign({}, out.weeks[key] || {}, rows);
+        });
+      }
+      if (src.conflicts && typeof src.conflicts === 'object') out.conflicts = src.conflicts;
+      return out;
+    }
+
+    function sanitizeIhk(i) {
+      const out = {};
+      if (!i || typeof i !== 'object') return out;
+      Object.keys(i).forEach(id => {
+        if (!/^\d{1,2}$/.test(id) || !i[id] || typeof i[id] !== 'object') return;
+        out[id] = { school: !!i[id].school, summary: !!i[id].summary };
+      });
+      return out;
+    }
+
+    const CFG_BOOL_KEYS = ['setupDone', 'localAutoBackup', 'autoSyncOnedrive', 'githubImageTransfer', 'githubDraftAutoSync', 'startupAutoRecovery'];
+    const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+    function sanitizeCfg(c) {
+      const out = {};
+      if (!c || typeof c !== 'object') return out;
+      if (typeof c.token === 'string' && /^[A-Za-z0-9_]{1,255}$/.test(c.token.trim())) out.token = c.token.trim();
+      if (typeof c.repo === 'string' && (c.repo === '' || /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/.test(c.repo.trim()))) out.repo = c.repo.trim();
+      if (typeof c.beruf === 'string' && BERUF_PRESETS[c.beruf]) out.beruf = c.beruf;
+      ['profession', 'betrieb'].forEach(k => { if (typeof c[k] === 'string') out[k] = c[k].slice(0, 120); });
+      if (typeof c.onedriveFolderName === 'string') out.onedriveFolderName = c.onedriveFolderName.slice(0, 255);
+      ['startDate', 'ap1Date', 'ap2Date'].forEach(k => { if (typeof c[k] === 'string' && DATE_RE.test(c[k])) out[k] = c[k]; });
+      if (c.charLimitDay !== undefined) out.charLimitDay = Math.round(clampNum(c.charLimitDay, 100, 20000, 1000));
+      if (c.charLimitReport !== undefined) out.charLimitReport = Math.round(clampNum(c.charLimitReport, 100, 20000, 2000));
+      CFG_BOOL_KEYS.forEach(k => { if (typeof c[k] === 'boolean') out[k] = c[k]; });
+      if (c.folders !== undefined) {
+        const f = sanitizeFolderList(c.folders);
+        if (f) out.folders = f;
+      }
+      if (typeof c.foldersVersion === 'number') out.foldersVersion = c.foldersVersion;
+      return out;
     }
 
     function fmtH(h) {
@@ -4825,7 +5062,7 @@
       return Number.isInteger(num) ? num.toFixed(0) : (num % 0.5 === 0 ? num.toFixed(1) : num.toFixed(2));
     }
 
-    function getKwDates(kw, year = (planner.selectedYear || 2026)) {
+    function getKwDates(kw, year = (planner.selectedYear || defaultPlannerYear())) {
       const simple = new Date(year, 0, 4);
       const dayOfWeek = (simple.getDay() + 6) % 7;
       const mon1 = new Date(year, 0, 4 - dayOfWeek);
@@ -4886,59 +5123,126 @@
     }
     window.getGermanHolidays = getGermanHolidays;
 
-    function getTrainingWeekInfo(kw, year = (planner.selectedYear || 2026)) {
-      if (year < 2026 || (year === 2026 && kw < 36)) {
-        return { label: 'Vor Beginn', detailedLabel: 'Vor Ausbildungsbeginn', yearNumber: 0, weekInYear: 0, totalWeeks: 0, isPreStart: true };
-      }
-      let totalWeeks = 0;
-      let yearNumber = 1;
-      let weekInYear = 1;
+    // =======================================================================
+    // AUSBILDUNGSZEITRAUM & ISO-WOCHENJAHR
+    // Frueher war der Zeitraum fest verdrahtet (Start KW36/2026, Jahre
+    // 2026-2029, immer 52 Wochen). Fuer jeden anderen Jahrgang stimmten damit
+    // Nachweisnummern, Ausbildungsjahr und der Archivordner nicht, und KW53
+    // (z. B. 28.12.2026-03.01.2027) war gar nicht erreichbar.
+    // Jetzt kommt alles aus cfg.startDate (Beginn) und cfg.ap2Date (Ende).
+    // Datumsrechnung nur ueber den Date-Konstruktor (Tage), nie ueber
+    // Millisekunden - sonst verschiebt die Sommerzeit den Tag.
+    // =======================================================================
+    function parseIsoDateLocal(s) {
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s || ''));
+      return m ? new Date(+m[1], +m[2] - 1, +m[3]) : null;
+    }
 
-      if (year === 2026) {
-        yearNumber = 1;
-        weekInYear = kw - 35;
-        totalWeeks = weekInYear;
-      } else if (year === 2027) {
-        if (kw <= 35) {
-          yearNumber = 1;
-          weekInYear = 17 + kw;
-          totalWeeks = weekInYear;
-        } else {
-          yearNumber = 2;
-          weekInYear = kw - 35;
-          totalWeeks = 52 + weekInYear;
-        }
-      } else if (year === 2028) {
-        if (kw <= 35) {
-          yearNumber = 2;
-          weekInYear = 17 + kw;
-          totalWeeks = 52 + weekInYear;
-        } else {
-          yearNumber = 3;
-          weekInYear = kw - 35;
-          totalWeeks = 104 + weekInYear;
-        }
-      } else {
-        yearNumber = 3;
-        weekInYear = 17 + kw;
-        totalWeeks = 104 + weekInYear;
+    function getIsoWeekYear(d = new Date()) {
+      const t = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+      t.setDate(t.getDate() + 3 - (t.getDay() + 6) % 7);   // Donnerstag der Woche
+      return { week: getCalendarWeek(d), year: t.getFullYear() };
+    }
+
+    // 28. Dezember liegt immer in der letzten ISO-Woche des Jahres
+    function weeksInIsoYear(y) { return getCalendarWeek(new Date(y, 11, 28)); }
+
+    function mondayOfIsoWeek(kw, y) {
+      const jan4 = new Date(y, 0, 4);
+      return new Date(y, 0, 4 - (jan4.getDay() + 6) % 7 + (kw - 1) * 7);
+    }
+
+    function mondayOf(date) {
+      return new Date(date.getFullYear(), date.getMonth(), date.getDate() - (date.getDay() + 6) % 7);
+    }
+
+    function weeksBetween(a, b) { return Math.round((b - a) / (7 * 86400000)); }
+
+    function trainingStartDate() { return parseIsoDateLocal(cfg.startDate) || new Date(2026, 8, 1); }
+
+    // Montag der Woche, in die der n-te Jahrestag des Beginns faellt. Die
+    // Woche mit dem Jahrestag gehoert damit - wie die Startwoche selbst - zum
+    // neuen Ausbildungsjahr.
+    function trainingYearStartMonday(n) {
+      const s = trainingStartDate();
+      return mondayOf(new Date(s.getFullYear() + (n - 1), s.getMonth(), s.getDate()));
+    }
+
+    function trainingEndDate() {
+      const ap2 = parseIsoDateLocal(cfg.ap2Date);
+      if (ap2) return new Date(ap2.getFullYear(), ap2.getMonth(), ap2.getDate() + 56);
+      const s = trainingStartDate();
+      return new Date(s.getFullYear() + 3, s.getMonth() + 6, s.getDate());
+    }
+
+    function trainingYearRange() {
+      const first = getIsoWeekYear(trainingYearStartMonday(1)).year;
+      const last = getIsoWeekYear(trainingEndDate()).year;
+      return { first, last: Math.max(first, last) };
+    }
+
+    function defaultPlannerYear() {
+      const r = trainingYearRange();
+      const y = getIsoWeekYear(new Date()).year;
+      return Math.min(r.last, Math.max(r.first, y));
+    }
+
+    // Haelt planner.selectedYear/Kw innerhalb des Zeitraums und des Jahres
+    // (KW53 gibt es nicht in jedem Jahr).
+    function clampPlannerSelection() {
+      const r = trainingYearRange();
+      let y = Number(planner.selectedYear) || defaultPlannerYear();
+      let kw = Number(planner.selectedKw) || 1;
+      if (y < r.first) { const s = getIsoWeekYear(trainingYearStartMonday(1)); y = s.year; kw = s.week; }
+      if (y > r.last) { y = r.last; kw = weeksInIsoYear(y); }
+      kw = Math.min(Math.max(1, kw), weeksInIsoYear(y));
+      planner.selectedYear = y;
+      planner.selectedKw = kw;
+    }
+
+    function getTrainingWeekInfo(kw, year = (planner.selectedYear || defaultPlannerYear())) {
+      const mon = mondayOfIsoWeek(kw, year);
+      const start = trainingYearStartMonday(1);
+      if (mon < start) {
+        return { label: 'Vor Beginn', detailedLabel: 'Vor Ausbildungsbeginn', yearNumber: 0, weekInYear: 0, totalWeeks: 0, isPreStart: true, isPostEnd: false };
       }
+      let yearNumber = 1;
+      while (yearNumber < 10 && trainingYearStartMonday(yearNumber + 1) <= mon) yearNumber++;
+      const weekInYear = weeksBetween(trainingYearStartMonday(yearNumber), mon) + 1;
+      const totalWeeks = weeksBetween(start, mon) + 1;
+      const isPostEnd = mon > trainingEndDate();
 
       return {
         label: `Woche ${weekInYear} (${yearNumber}. Jahr)`,
-        detailedLabel: `Woche ${weekInYear} (${yearNumber}. Ausbildungsjahr • Gesamt: #${totalWeeks})`,
+        detailedLabel: `Woche ${weekInYear} (${yearNumber}. Ausbildungsjahr • Gesamt: #${totalWeeks})` + (isPostEnd ? ' • nach Ausbildungsende' : ''),
         yearNumber,
         weekInYear,
         totalWeeks,
-        isPreStart: false
+        isPreStart: false,
+        isPostEnd
       };
     }
 
-    function getTrainingWeekLabel(kw, year = (planner.selectedYear || 2026)) {
+    // Ordner Ausbildungsjahr_N + KW -> Kalenderjahr (fuer Dateien ohne _JJJJ
+    // im Namen). null, wenn die Kombination im Zeitraum nicht vorkommt.
+    function yearForTrainingFolder(kw, folderName) {
+      const m = /^Ausbildungsjahr_(\d+)$/.exec(String(folderName || ''));
+      if (!m) return null;
+      const n = +m[1];
+      const r = trainingYearRange();
+      for (let y = r.first; y <= r.last + 1; y++) {
+        if (kw > weeksInIsoYear(y)) continue;
+        const info = getTrainingWeekInfo(kw, y);
+        if (!info.isPreStart && info.yearNumber === n) return y;
+      }
+      return null;
+    }
+
+    function getTrainingWeekLabel(kw, year = (planner.selectedYear || defaultPlannerYear())) {
       return getTrainingWeekInfo(kw, year).label;
     }
 
-    function getTrainingYearFolder(kw, year = (planner.selectedYear || 2026)) {
+    function getTrainingYearFolder(kw, year = (planner.selectedYear || defaultPlannerYear())) {
       const info = getTrainingWeekInfo(kw, year);
       const yrNum = info.yearNumber > 0 ? info.yearNumber : 1;
       return `Ausbildungsjahr_${yrNum}`;
@@ -4954,8 +5258,12 @@
       const actionCont = document.getElementById('toastActionContainer');
 
       b.className = `status-banner show ${type}`;
-      const cleanMsg = (msg || '').replace(/^[✓✔⚡⚠️ℹ️✕\s]+/u, '');
-      text.innerHTML = cleanMsg;
+      // Standard ist reiner Text. Markup nur ueber html`...` (escaped Werte).
+      if (msg && typeof msg === 'object' && typeof msg.__html === 'string') {
+        text.innerHTML = msg.__html.replace(/^[✓✔⚡⚠️ℹ️✕\s]+/u, '');
+      } else {
+        text.textContent = String(msg || '').replace(/^[✓✔⚡⚠️ℹ️✕\s]+/u, '');
+      }
       icon.innerHTML = type === 'loading' ? '<div class="spinner-sm"></div>' : (type === 'success' ? '✓' : (type === 'warning' ? '⚡' : '⚠️'));
       actionCont.innerHTML = '';
 
@@ -5097,8 +5405,9 @@
         try {
           const target = '#' + TAB_HASHES[tabId];
           const cur = window.location.hash || '';
-          // Token-/Repo-Fallback im Hash niemals ueberschreiben
-          if (cur !== target && !/token=|repo=/i.test(cur)) {
+          // Der Token-Fallback entfernt seine Parameter selbst beim Start
+          // (checkHashTokenFallback) - hier gibt es nichts mehr zu schuetzen.
+          if (cur !== target) {
             history.replaceState(null, '', target);
           }
         } catch (e) { /* file:// Restriktionen ignorieren */ }
@@ -5193,7 +5502,7 @@
     // Settings
     function loadSettings() {
       const s = localStorage.getItem(KEY_CFG);
-      if (s) try { cfg = { ...cfg, ...JSON.parse(s) }; } catch(e){}
+      if (s) try { cfg = { ...cfg, ...sanitizeCfg(JSON.parse(s)) }; } catch(e){}
       ensureFolderRegistry();
       document.getElementById('cfgToken').value = cfg.token || '';
       document.getElementById('cfgRepo').value = cfg.repo || '';
@@ -5509,7 +5818,12 @@
       if (cfg.beruf !== prev.beruf || cfg.profession !== prev.profession || cfg.startDate !== prev.startDate) {
         renderBrandSubtitle();
       }
-      if (cfg.startDate !== prev.startDate) renderSidebarRadar();
+      if (cfg.startDate !== prev.startDate || cfg.ap2Date !== prev.ap2Date) {
+        clampPlannerSelection();
+        renderPlanner();
+        renderSidebarRadar();
+      }
+      if (prev.token && !cfg.token) deleteAuthFromIdb();   // Token bewusst entfernt
       if (cfg.repo !== prev.repo) {
         // Die Sync-Basis gehoert zu genau einem Repository.
         const b = currentSyncBase();
@@ -5542,7 +5856,7 @@
 
       // Echte Warnung: ab jetzt wird jeder Entwurf dauerhaft committed
       if (cfg.githubDraftAutoSync && !prev.draftSync) {
-        notify('warning', 'Entwurf Auto-Sync <strong>aktiviert</strong> \u2013 Entw\u00fcrfe werden ab jetzt dauerhaft committed.');
+        notify('warning', html`Entwurf Auto-Sync <strong>aktiviert</strong> \u2013 Entw\u00fcrfe werden ab jetzt dauerhaft committed.`);
       }
 
       flashSettingsSaved();
@@ -5628,11 +5942,16 @@
     document.getElementById('fileInputBackup').addEventListener('change', handleBackupFileSelected);
 
     function exportFullBackup() {
+      // Das Token gehoert NICHT in eine Datei, die im Downloads-Ordner liegt,
+      // in OneDrive landet oder weitergegeben wird. Nach einem Import wird es
+      // einfach neu eingetragen.
+      const safeCfg = { ...cfg };
+      delete safeCfg.token;
       const backupData = {
         app: 'Ausbildungs-Cockpit',
         version: '6.0',
         exportedAt: new Date().toISOString(),
-        cfg,
+        cfg: safeCfg,
         worktime,
         planner,
         ihkProgress
@@ -5648,7 +5967,7 @@
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
-      notify('success', 'Backup-Datei heruntergeladen.');
+      notify('success', 'Backup-Datei heruntergeladen (ohne GitHub-Token).');
     }
 
     function handleBackupFileSelected(e) {
@@ -5678,25 +5997,39 @@
             ihkProgress: JSON.parse(JSON.stringify(ihkProgress))
           };
 
+          // Eine Backup-Datei ist fremde Eingabe: alles durch die
+          // Schema-Bereinigung. Zugangsdaten und die geraetebezogene
+          // Ordner-Verknuepfung werden nie stillschweigend uebernommen.
           if (imported.cfg) {
-            cfg = { ...cfg, ...imported.cfg };
+            const incoming = sanitizeCfg(imported.cfg);
+            delete incoming.onedriveFolderName;
+            const credsDiffer = (incoming.token && incoming.token !== cfg.token)
+                             || (incoming.repo !== undefined && incoming.repo !== cfg.repo);
+            if (credsDiffer && !confirm(
+              'Das Backup enthält GitHub-Zugangsdaten' + (incoming.repo ? ` (Repository: ${incoming.repo})` : '') + '.\n\n' +
+              'OK = übernehmen\nAbbrechen = deine aktuellen Zugangsdaten behalten')) {
+              delete incoming.token;
+              delete incoming.repo;
+            }
+            cfg = { ...cfg, ...incoming };
             localStorage.setItem(KEY_CFG, JSON.stringify(cfg));
           }
           if (imported.worktime) {
-            worktime = { ...worktime, ...imported.worktime };
+            worktime = { ...worktime, ...sanitizeWorktime(imported.worktime) };
             localStorage.setItem(KEY_WORKTIME, JSON.stringify(worktime));
           }
           if (imported.planner) {
-            planner = { ...planner, ...imported.planner };
-            Object.values(planner.weeks || {}).forEach(w => {
-              if (!w.notes) w.notes = { mo: '', di: '', mi: '', do: '', fr: '' };
-              if (!w.days) w.days = { mo: [], di: [], mi: [], do: [], fr: [] };
-              if (!w.dayTargets) w.dayTargets = { mo: 7.75, di: 7.75, mi: 7.75, do: 7.75, fr: 6.0 };
-            });
+            const clean = sanitizePlanner(imported.planner);
+            planner = {
+              selectedKw: planner.selectedKw,
+              selectedYear: planner.selectedYear,
+              weeks: clean.weeks
+            };
+            if (clean.conflicts) planner.conflicts = clean.conflicts;
             localStorage.setItem(KEY_PLANNER, JSON.stringify(planner));
           }
           if (imported.ihkProgress) {
-            ihkProgress = { ...ihkProgress, ...imported.ihkProgress };
+            ihkProgress = { ...ihkProgress, ...sanitizeIhk(imported.ihkProgress) };
             localStorage.setItem(KEY_IHK, JSON.stringify(ihkProgress));
           }
 
@@ -5746,7 +6079,7 @@
       box.innerHTML = list.map(f =>
         `<button class="folder-pill${f.id === currentSelectedFolderId ? ' active' : ''}` +
         `${folderStatus[f.id] === 'missing' ? ' missing' : ''}" ` +
-        `data-folder-id="${f.id}" data-backend="${escapeHtml(f.backend || 'github')}" ` +
+        `data-folder-id="${escapeHtml(f.id)}" data-backend="${escapeHtml(f.backend || 'github')}" ` +
         `title="${escapeHtml(f.path)}">${escapeHtml(f.label)}</button>`
       ).join('') +
         '<button class="folder-pill folder-pill-add" data-folder-add="1" ' +
@@ -5758,9 +6091,9 @@
       if (!sel) return;
       const prev = sel.value;
       sel.innerHTML = (cfg.folders || []).map(f =>
-        `<option value="${f.id}">${escapeHtml(f.label)} — ${escapeHtml(f.path)}</option>`
+        `<option value="${escapeHtml(f.id)}">${escapeHtml(f.label)} — ${escapeHtml(f.path)}</option>`
       ).join('');
-      if (prev && sel.querySelector(`option[value="${prev}"]`)) sel.value = prev;
+      if (prev && sel.querySelector(`option[value="${CSS.escape(prev)}"]`)) sel.value = prev;
     }
 
     // --- Ordner-Verwaltung (Einstellungen -> Ordner) -----------------------
@@ -5844,19 +6177,19 @@
         const opts = Object.keys(FOLDER_ROLES).map(r =>
           `<option value="${r}"${f.role === r ? ' selected' : ''}>${r === 'screenshots' ? 'Strg+V' : 'Ablage'}</option>`
         ).join('');
-        return `<div class="sync-control-row folder-admin-row" data-fid="${f.id}">
+        return `<div class="sync-control-row folder-admin-row" data-fid="${escapeHtml(f.id)}">
           <input class="folder-admin-label" type="text" value="${escapeHtml(f.label)}" maxlength="24"
-                 title="Anzeigename auf dem Reiter" onchange="setFolderLabel('${f.id}', this.value, this)">
+                 title="Anzeigename auf dem Reiter" onchange="setFolderLabel(${jsArg(f.id)}, this.value, this)">
           <input class="folder-admin-path" type="text" value="${escapeHtml(f.path)}" maxlength="180"
-                 title="Zielpfad im Repository \u2013 verschiebt keine Dateien" onchange="setFolderPath('${f.id}', this.value, this)">
-          <select class="folder-admin-role" title="Rolle \u2013 wandert, wenn du sie hier vergibst" onchange="setFolderRole('${f.id}', this.value)">
+                 title="Zielpfad im Repository \u2013 verschiebt keine Dateien" onchange="setFolderPath(${jsArg(f.id)}, this.value, this)">
+          <select class="folder-admin-role" title="Rolle \u2013 wandert, wenn du sie hier vergibst" onchange="setFolderRole(${jsArg(f.id)}, this.value)">
             <option value=""${f.role ? '' : ' selected'} disabled>\u2013</option>
             ${opts}
           </select>
           <span class="folder-order-btns">
-            <button type="button" class="btn btn-ghost btn-sm btn-icon" title="Nach oben"${i === 0 ? ' disabled' : ''} onclick="moveFolder('${f.id}', -1)">\u25B2</button>
-            <button type="button" class="btn btn-ghost btn-sm btn-icon" title="Nach unten"${i === list.length - 1 ? ' disabled' : ''} onclick="moveFolder('${f.id}', 1)">\u25BC</button>
-            <button type="button" class="btn btn-ghost btn-danger btn-sm btn-icon" title="Reiter entfernen \u2013 Dateien bleiben" onclick="removeFolder('${f.id}')">\u2715</button>
+            <button type="button" class="btn btn-ghost btn-sm btn-icon" title="Nach oben"${i === 0 ? ' disabled' : ''} onclick="moveFolder(${jsArg(f.id)}, -1)">\u25B2</button>
+            <button type="button" class="btn btn-ghost btn-sm btn-icon" title="Nach unten"${i === list.length - 1 ? ' disabled' : ''} onclick="moveFolder(${jsArg(f.id)}, 1)">\u25BC</button>
+            <button type="button" class="btn btn-ghost btn-danger btn-sm btn-icon" title="Reiter entfernen \u2013 Dateien bleiben" onclick="removeFolder(${jsArg(f.id)})">\u2715</button>
           </span>
         </div>`;
       }).join('');
@@ -5931,7 +6264,7 @@
       const f = getFolder(id);
       if (!f) return;
       if (f.role) {
-        notify('warning', `<strong>${escapeHtml(f.label)}</strong> ist ${escapeHtml(FOLDER_ROLES[f.role])}. Die Rolle zuerst auf einen anderen Reiter legen.`);
+        notify('warning', html`<strong>${f.label}</strong> ist ${FOLDER_ROLES[f.role]}. Die Rolle zuerst auf einen anderen Reiter legen.`);
         return;
       }
       if (!confirm(`Reiter "${f.label}" entfernen?\n\nDer Ordner ${f.path} und alle Dateien darin bleiben unverändert.`)) return;
@@ -6266,7 +6599,7 @@
       cfg.setupDone = true;
       persistSetup();
       closeSetup();
-      notify('success', 'Übersprungen. Alles davon steht auch unter <strong>⚙️ Einstellungen</strong>.');
+      notify('success', html`Übersprungen. Alles davon steht auch unter <strong>⚙️ Einstellungen</strong>.`);
     });
 
     // Einstiegspunkt der "+"-Pill aus Tab 1
@@ -6534,7 +6867,7 @@
       expList.innerHTML =
         '<div style="padding: 0.6rem 0; display: flex; flex-direction: column; gap: 0.45rem; align-items: flex-start;">' +
           '<div style="color: var(--text-muted); font-size: 0.78rem;">Ordner <code>' + escapeHtml(folder.path) + '</code> existiert im Repository nicht.</div>' +
-          '<button type="button" class="btn btn-accent btn-sm" onclick="createFolderOnGithub(\'' + folder.id + '\')">Ordner anlegen</button>' +
+          '<button type="button" class="btn btn-accent btn-sm" onclick="createFolderOnGithub(' + jsArg(folder.id) + ')">Ordner anlegen</button>' +
         '</div>';
     }
 
@@ -6556,11 +6889,11 @@
         return;
       }
 
-      notify('loading', `Lege ${escapeHtml(f.path)} an...`);
+      notify('loading', `Lege ${f.path} an...`);
       try {
         await backendFor(f).ensureDir(f.path);
         folderStatus[f.id] = 'ok';
-        notify('success', `Ordner <strong>${escapeHtml(f.path)}</strong> angelegt.`);
+        notify('success', html`Ordner <strong>${f.path}</strong> angelegt.`);
         loadExplorerFiles();
       } catch(e) {
         notify('error', 'Anlegen fehlgeschlagen: ' + e.message);
@@ -6703,7 +7036,7 @@
         const ref = await backendFor(targetFolder).write(targetFolder.path, filename, blob, { message: `Upload ${filename}` });
         lastUpload = ref;
 
-        notify('success', `Hochgeladen: <strong>${escapeHtml(filename)}</strong>`, () => undoUpload(ref), 'Rückgängig');
+        notify('success', html`Hochgeladen: <strong>${filename}</strong>`, () => undoUpload(ref), 'Rückgängig');
 
         currentSelectedFolderId = targetFolder.id;
         renderFolderPills();
@@ -6806,7 +7139,7 @@
             notify('error', 'Rückgängig fehlgeschlagen: ' + e.message);
           }
         });
-        notify('success', `Datei umbenannt in <strong>${escapeHtml(newName)}</strong>.`);
+        notify('success', html`Datei umbenannt in <strong>${newName}</strong>.`);
         loadExplorerFiles();
       } catch(e) {
         notify('error', 'Umbenennen fehlgeschlagen: ' + e.message);
@@ -6835,11 +7168,11 @@
         loadExplorerFiles();
 
         if (cachedBlob) {
-          notify('warning', `<strong>${escapeHtml(ref.name)}</strong> gelöscht.`,
+          notify('warning', html`<strong>${ref.name}</strong> gelöscht.`,
             () => restoreDeletedFile(ref.key), 'Wiederherstellen');
         } else {
           // Ehrlich statt einen Knopf anzubieten, der nichts tun kann.
-          notify('warning', `<strong>${escapeHtml(ref.name)}</strong> gelöscht. Der Inhalt liess sich vorher nicht sichern, Wiederherstellen ist nicht möglich.`);
+          notify('warning', html`<strong>${ref.name}</strong> gelöscht. Der Inhalt liess sich vorher nicht sichern, Wiederherstellen ist nicht möglich.`);
         }
       } catch(e) {
         notify('error', 'Löschen fehlgeschlagen: ' + e.message);
@@ -6891,7 +7224,9 @@
         const ext = ref.name.split('.').pop().toLowerCase();
 
         if (['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp'].includes(ext)) {
-          previewObjectUrl = URL.createObjectURL(blob);
+          // Als <img> fuehrt auch ein SVG kein Skript aus; der Typ muss aber
+          // stimmen, sonst zeigt der Browser gar nichts an.
+          previewObjectUrl = URL.createObjectURL(ext === 'svg' ? new Blob([blob], { type: 'image/svg+xml' }) : blob);
           body.innerHTML = `<img src="${previewObjectUrl}" style="max-width:100%; max-height:55vh; border-radius:3px;">`;
         } else if (['md', 'txt', 'json', 'ps1', 'py', 'js', 'html', 'css'].includes(ext)) {
           const txt = await blob.text();
@@ -6901,7 +7236,10 @@
           cBtn.style.display = 'inline-flex';
           cBtn.onclick = () => { navigator.clipboard.writeText(txt); notify('success', 'Kopiert.'); };
         } else if (ext === 'pdf') {
-          previewObjectUrl = URL.createObjectURL(blob);
+          // Typ erzwingen: eine als .pdf getarnte HTML-Datei liefe sonst als
+          // gleich-origin Dokument (mit Zugriff auf localStorage und Token).
+          // sandbox="" ginge nicht - damit blockiert Chrome den PDF-Viewer.
+          previewObjectUrl = URL.createObjectURL(new Blob([blob], { type: 'application/pdf' }));
           body.innerHTML = `<iframe src="${previewObjectUrl}" style="width:100%; height:55vh; border:none;"></iframe>`;
         } else {
           body.innerHTML = '<div style="color: var(--text-muted); font-size: 0.78rem;">Keine direkte Vorschau verfügbar.</div>';
@@ -6939,18 +7277,16 @@
     // =========================================================================
     let activeScratchpadDay = 'mo';
 
-    function getWeekStorageKey(kw, year = (planner.selectedYear || 2026)) {
-      if (year === 2026) {
-        if (planner.weeks[`2026_${kw}`]) return `2026_${kw}`;
-        return kw;
-      }
+    function getWeekStorageKey(kw, year = (planner.selectedYear || defaultPlannerYear())) {
+      // Einheitlich 'JJJJ_KW'. Alte Schluessel ohne Jahr ('40') schreibt
+      // sanitizePlanner() beim Laden auf '2026_40' um.
       return `${year}_${kw}`;
     }
 
     function emptyWeekTemplate() {
       return {
         days: { mo: [], di: [], mi: [], do: [], fr: [] },
-        dayTargets: { mo: 7.75, di: 7.75, mi: 7.75, do: 7.75, fr: 6.0 },
+        dayTargets: templateDayTargets(),
         dayPresets: { mo: null, di: null, mi: null, do: null, fr: null },
         notes: { mo: '', di: '', mi: '', do: '', fr: '' },
         av: { title: '', notes: '' },
@@ -6964,7 +7300,7 @@
     // den Cloud-Entwurf wanderten und dort beim Abgleich echte Wochen
     // ueberschreiben konnten. Fehlt die Woche, kommt jetzt eine frische,
     // NICHT eingehaengte Vorlage zurueck. Wer schreiben will: ensureWeekData().
-    function getWeekData(kw, year = (planner.selectedYear || 2026)) {
+    function getWeekData(kw, year = (planner.selectedYear || defaultPlannerYear())) {
       const existing = planner.weeks[getWeekStorageKey(kw, year)];
       if (!existing) return emptyWeekTemplate();
 
@@ -6978,7 +7314,7 @@
     }
 
     // Fuer alle Aufrufer, die die Woche veraendern: legt sie bei Bedarf an.
-    function ensureWeekData(kw, year = (planner.selectedYear || 2026)) {
+    function ensureWeekData(kw, year = (planner.selectedYear || defaultPlannerYear())) {
       const key = getWeekStorageKey(kw, year);
       if (!planner.weeks[key]) planner.weeks[key] = emptyWeekTemplate();
       return getWeekData(kw, year);
@@ -6994,7 +7330,8 @@
       const parts = weekParts(w);
       if (!Object.keys(parts).every(n => isEmptyPart(n, parts[n]))) return false;
       const t = w.dayTargets || {};
-      return Object.keys(DEFAULT_DAY_TARGETS).every(d => t[d] === undefined || t[d] === DEFAULT_DAY_TARGETS[d]);
+      const tpl = templateDayTargets();
+      return Object.keys(DEFAULT_DAY_TARGETS).every(d => t[d] === undefined || t[d] === DEFAULT_DAY_TARGETS[d] || t[d] === tpl[d]);
     }
 
     // Einmal beim Start: Stub-Wochen aus aelteren Versionen entfernen. Vorher
@@ -7004,7 +7341,7 @@
       const weeks = planner.weeks || {};
       const stubs = Object.keys(weeks).filter(k => isEmptyWeek(weeks[k]));
       if (!stubs.length) return 0;
-      const before = JSON.parse(JSON.stringify(buildStateSnapshot(false)));
+      const before = JSON.parse(JSON.stringify(buildStateSnapshot()));
       queueIdbWrite(async () => {
         const db = await openSnapshotDb();
         await idbPut(db, 'pre_migration_prune_' + Date.now(), before);
@@ -7017,7 +7354,7 @@
     }
 
     function updateRadarYearPillsUI() {
-      const curY = planner.selectedYear || 2026;
+      const curY = planner.selectedYear || defaultPlannerYear();
       document.querySelectorAll('#radarYearPills .folder-pill').forEach(b => {
         b.classList.toggle('active', parseInt(b.dataset.ryear, 10) === curY);
       });
@@ -7027,31 +7364,22 @@
       const s = localStorage.getItem(KEY_PLANNER);
       if (s) {
         try {
-          const parsed = JSON.parse(s);
-          planner.selectedKw = parsed.selectedKw || getCalendarWeek();
-          planner.selectedYear = parsed.selectedYear || Math.max(2026, new Date().getFullYear());
-          planner.weeks = parsed.weeks || {};
-          // Migrate any 8.0/5.0 targets to 7.75/6.0 and ensure notes & presets objects
-          Object.values(planner.weeks).forEach(w => {
-            if (w.dayTargets) {
-              if (w.dayTargets.mo === 8.0) w.dayTargets.mo = 7.75;
-              if (w.dayTargets.di === 8.0) w.dayTargets.di = 7.75;
-              if (w.dayTargets.mi === 8.0) w.dayTargets.mi = 7.75;
-              if (w.dayTargets.do === 8.0) w.dayTargets.do = 7.75;
-              if (w.dayTargets.fr === 5.0) w.dayTargets.fr = 6.0;
-            }
-            if (!w.notes) {
-              w.notes = { mo: '', di: '', mi: '', do: '', fr: '' };
-            }
-            if (!w.dayPresets) {
-              w.dayPresets = { mo: null, di: null, mi: null, do: null, fr: null };
-            }
-          });
+          // sanitizePlanner erzwingt das Schema, schreibt Alt-Schluessel
+          // ('40' -> '2026_40') um und ergaenzt fehlende Felder. Die fruehere
+          // Zwangsmigration 8,0 -> 7,75 / 5,0 -> 6,0 ist entfallen: sie hat
+          // bei jedem Start die 38,5- und 40-h-Modelle zerstoert.
+          const clean = sanitizePlanner(JSON.parse(s));
+          planner.selectedKw = clean.selectedKw;
+          planner.selectedYear = clean.selectedYear || defaultPlannerYear();
+          planner.weeks = clean.weeks;
+          if (clean.conflicts) planner.conflicts = clean.conflicts;
           pruneEmptyWeeks();
-        } catch(e){}
+          localStorage.setItem(KEY_PLANNER, JSON.stringify(planner));
+        } catch(e){ console.warn('[Planner] Laden:', e); }
       } else {
-        planner.selectedYear = Math.max(2026, new Date().getFullYear());
+        planner.selectedYear = defaultPlannerYear();
       }
+      clampPlannerSelection();
 
       const curDay = ['so', 'mo', 'di', 'mi', 'do', 'fr', 'sa'][new Date().getDay()];
       if (['mo', 'di', 'mi', 'do', 'fr'].includes(curDay)) {
@@ -7061,15 +7389,18 @@
         setQcDay('mo');
       }
 
+      // Navigation im ISO-Wochenjahr: 52 oder 53 Wochen, Grenzen aus dem
+      // Ausbildungszeitraum (cfg.startDate / cfg.ap2Date) statt 2026-2029.
       document.getElementById('btnPrevKw').addEventListener('click', () => {
-        const curY = planner.selectedYear || 2026;
+        const curY = planner.selectedYear || defaultPlannerYear();
+        const range = trainingYearRange();
         if (planner.selectedKw > 1) {
           planner.selectedKw--;
-        } else if (curY > 2026) {
+        } else if (curY > range.first) {
           planner.selectedYear = curY - 1;
-          planner.selectedKw = 52;
+          planner.selectedKw = weeksInIsoYear(curY - 1);
         } else {
-          notify('warning', 'Bereits bei KW 1 von 2026.');
+          notify('warning', `Bereits bei KW 1/${range.first} – Anfang des Ausbildungszeitraums.`);
           return;
         }
         savePlannerState();
@@ -7078,14 +7409,15 @@
       });
 
       document.getElementById('btnNextKw').addEventListener('click', () => {
-        const curY = planner.selectedYear || 2026;
-        if (planner.selectedKw < 52) {
+        const curY = planner.selectedYear || defaultPlannerYear();
+        const range = trainingYearRange();
+        if (planner.selectedKw < weeksInIsoYear(curY)) {
           planner.selectedKw++;
-        } else if (curY < 2029) {
+        } else if (curY < range.last) {
           planner.selectedYear = curY + 1;
           planner.selectedKw = 1;
         } else {
-          notify('warning', 'Ende des Ausbildungszeitraums (2029) erreicht.');
+          notify('warning', `Ende des Ausbildungszeitraums (${range.last}) erreicht.`);
           return;
         }
         savePlannerState();
@@ -7096,27 +7428,35 @@
       const btnToday = document.getElementById('btnCurrentKwToday');
       if (btnToday) {
         btnToday.addEventListener('click', () => {
-          const today = new Date();
-          planner.selectedYear = Math.max(2026, today.getFullYear());
-          planner.selectedKw = getCalendarWeek(today);
+          // ISO-Woche UND ISO-Jahr: am 01.01.2027 ist das KW53/2026,
+          // nicht KW53/2027.
+          const iso = getIsoWeekYear(new Date());
+          planner.selectedYear = iso.year;
+          planner.selectedKw = iso.week;
+          clampPlannerSelection();
           savePlannerState();
           renderPlanner();
           renderSidebarRadar();
         });
       }
 
-      // Year pills in Radar Header
-      document.querySelectorAll('#radarYearPills .folder-pill').forEach(btn => {
-        btn.addEventListener('click', () => {
+      // Jahres-Pills werden aus dem Ausbildungszeitraum erzeugt
+      // (renderRadarYearPills) - deshalb Delegation am Container.
+      const yearPillBox = document.getElementById('radarYearPills');
+      if (yearPillBox) {
+        yearPillBox.addEventListener('click', (e) => {
+          const btn = e.target.closest('.folder-pill[data-ryear]');
+          if (!btn) return;
           const yr = parseInt(btn.dataset.ryear, 10);
           if (yr && yr !== planner.selectedYear) {
             planner.selectedYear = yr;
+            clampPlannerSelection();
             savePlannerState();
             renderPlanner();
             renderSidebarRadar();
           }
         });
-      });
+      }
 
       document.getElementById('plannerAvTitle').addEventListener('input', () => {
         ensureWeekData(planner.selectedKw).av.title = document.getElementById('plannerAvTitle').value;
@@ -7137,7 +7477,7 @@
 
       document.getElementById('btnPlannerQcAdd').addEventListener('click', addPlannerQc);
       document.getElementById('plannerQcText').addEventListener('keydown', (e) => { if (e.key === 'Enter') addPlannerQc(); });
-      document.getElementById('btnDownloadWeekMd').addEventListener('click', () => downloadWeekMarkdown(planner.selectedKw, planner.selectedYear || 2026));
+      document.getElementById('btnDownloadWeekMd').addEventListener('click', () => downloadWeekMarkdown(planner.selectedKw, planner.selectedYear || defaultPlannerYear()));
       document.getElementById('btnDeduplicateWeek').addEventListener('click', deduplicateWeek);
       document.getElementById('btnExportCopilot').addEventListener('click', openCopilotExportModal);
       document.getElementById('btnCloseCopilotModal').addEventListener('click', closeCopilotExportModal);
@@ -7286,7 +7626,7 @@
       // Update day column header badge
       const nameEl = document.getElementById(`day-name-${activeScratchpadDay}`);
       if (nameEl) {
-        const dates = getKwDates(kw, planner.selectedYear || 2026);
+        const dates = getKwDates(kw, planner.selectedYear || defaultPlannerYear());
         const fullDayNames = { mo: 'Montag', di: 'Dienstag', mi: 'Mittwoch', do: 'Donnerstag', fr: 'Freitag' };
         const lines = val.trim().split('\n').filter(l => l.trim().length > 0);
         const noteIndicator = lines.length > 0 
@@ -7310,7 +7650,7 @@
 
     function findDayDuplicate(day, text, excludeTaskId = null) {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const data = getWeekData(kw, yr);
       const tasks = data.days[day] || [];
       const norm = normalizeTaskText(text);
@@ -7386,7 +7726,7 @@
 
     function applyWeekPreset(presetType) {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const data = ensureWeekData(kw, yr);
       const pCfg = PRESET_CONFIG[presetType];
       if (!pCfg) return;
@@ -7408,7 +7748,7 @@
 
     function saveScratchpadAsDayNote(isFromModal = false) {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const data = getWeekData(kw, yr);
       const day = activeScratchpadDay;
       const rawText = (data.notes && data.notes[day]) || '';
@@ -7431,7 +7771,7 @@
 
     function clearSingleDayNote(day) {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const data = getWeekData(kw, yr);
       if (!data.notes || !data.notes[day]) return;
       const old = data.notes[day];
@@ -7450,7 +7790,7 @@
 
     function transferScratchpadToDay(isFromModal = false, forceAll = false) {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const data = ensureWeekData(kw, yr);
       const day = activeScratchpadDay;
       const rawText = (data.notes && data.notes[day]) || '';
@@ -7775,14 +8115,14 @@
         cfg.onedriveFolderName = handle.name || 'OneDrive-Ordner';
         localStorage.setItem(KEY_CFG, JSON.stringify(cfg));
         updateOnedriveSettingsUI(handle.name);
-        notify('success', `Ordner <strong>${escapeHtml(handle.name)}</strong> erfolgreich verknüpft!`);
+        notify('success', html`Ordner <strong>${handle.name}</strong> erfolgreich verknüpft!`);
 
         const kw = planner.selectedKw;
-        const yr = planner.selectedYear || 2026;
+        const yr = planner.selectedYear || defaultPlannerYear();
         const md = generateWeekMarkdown(kw, yr);
         const ok = await writeMarkdownToLocalDir(kw, yr, md);
         if (ok) {
-          notify('success', `Aktuelle Woche KW ${kw} (${yr}) in <strong>${escapeHtml(handle.name)}</strong> abgelegt ✓`);
+          notify('success', html`Aktuelle Woche KW ${kw} (${yr}) in <strong>${handle.name}</strong> abgelegt ✓`);
         }
       } catch(err) {
         if (err.name !== 'AbortError') {
@@ -8086,7 +8426,9 @@
       }
 
       if (mdContent) {
-        const parsed = parseWeekMarkdown(mdContent);
+        const rawParsed = parseWeekMarkdown(mdContent);
+        const parsed = rawParsed ? sanitizeWeek(rawParsed) : null;
+        if (parsed && rawParsed.worktimeLog) parsed.worktimeLog = rawParsed.worktimeLog;
         if (parsed) {
           parsed._sha = loadedSha || cached?.sha || null;
           parsed._source = loadedSha ? 'github' : 'local';
@@ -8098,11 +8440,20 @@
           savePlannerState();
 
           // Arbeitszeiten wiederherstellen, falls in der Markdown-Tabelle vorhanden
+          // Arbeitszeiten unter 'JJJJ_KWn' - frueher landeten sie unter dem
+          // Planer-Schluessel, den die Arbeitszeit-Tabelle nie liest.
           if (parsed.worktimeLog) {
             worktime.weeks = worktime.weeks || {};
-            worktime.weeks[key] = { ...(worktime.weeks[key] || {}), ...parsed.worktimeLog };
+            const wk = wtKey(kw, yr);
+            const rows = {};
+            DAY_KEYS.forEach(d => {
+              const r = sanitizeWorkRow(parsed.worktimeLog[d], d);
+              if (r) { r.edited = true; rows[d] = r; }
+            });
+            worktime.weeks[wk] = { ...(worktime.weeks[wk] || {}), ...rows };
             saveWorktimeState();
           }
+          delete parsed.worktimeLog;
 
           schedulePersistLocalState(600);
           return { success: true, filename: sourceName, data: parsed };
@@ -8113,7 +8464,7 @@
 
     async function reloadCurrentWeekFromArchive() {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       notify('loading', `Lade KW ${kw} (${yr}) aus Archiv...`);
       const res = await tryLoadArchivedWeek(kw, yr, true);
       if (res && res.success) {
@@ -8127,7 +8478,7 @@
     window.reloadCurrentWeekFromArchive = reloadCurrentWeekFromArchive;
 
     // 1-Week Markdown Generator (Obsidian Vault & Human-First)
-    function generateWeekMarkdown(kw, yr = (planner.selectedYear || 2026)) {
+    function generateWeekMarkdown(kw, yr = (planner.selectedYear || defaultPlannerYear())) {
       const data = getWeekData(kw, yr);
       const weekInfo = getTrainingWeekInfo(kw, yr);
       const dates = getKwDates(kw, yr);
@@ -8140,10 +8491,10 @@
         totalTargetHours += data.dayTargets[d] || (d === 'fr' ? 6.0 : 7.75);
       });
 
-      const prevKw = kw > 1 ? kw - 1 : 52;
-      const prevYr = kw > 1 ? yr : (yr > 2026 ? yr - 1 : yr);
-      const nextKw = kw < 52 ? kw + 1 : 1;
-      const nextYr = kw < 52 ? yr : (yr < 2029 ? yr + 1 : yr);
+      const prevKw = kw > 1 ? kw - 1 : weeksInIsoYear(yr - 1);
+      const prevYr = kw > 1 ? yr : yr - 1;
+      const nextKw = kw < weeksInIsoYear(yr) ? kw + 1 : 1;
+      const nextYr = kw < weeksInIsoYear(yr) ? yr : yr + 1;
 
       const prevLink = `[[KW${String(prevKw).padStart(2, '0')}_${prevYr}|⬅️ KW ${prevKw}]]`;
       const nextLink = `[[KW${String(nextKw).padStart(2, '0')}_${nextYr}|KW ${nextKw} ➡️]]`;
@@ -8255,14 +8606,18 @@ ${tagsList.join('\n')}
       let sumSollMin = 0;
 
       ['mo', 'di', 'mi', 'do', 'fr'].forEach(d => {
-        const row = (worktime.weekLog && worktime.weekLog[d]) || { start: '07:00', end: d === 'fr' ? '13:15' : '15:30', pause: d === 'fr' ? 15 : 45, target: d === 'fr' ? 6.0 : 7.75 };
+        // Ist-Zeiten DIESER Woche (oder die Vorgabe) - nicht die zuletzt
+        // gerenderte Woche, wie frueher ueber das geteilte weekLog.
+        const row = peekWorkDayRow(d, kw, yr);
         const [sH, sM] = (row.start || '07:00').split(':').map(Number);
         const [eH, eM] = (row.end || (d === 'fr' ? '13:15' : '15:30')).split(':').map(Number);
         const sMin = Math.max(sH * 60 + sM, 6 * 60);
         const eMin = Math.min(eH * 60 + eM, 20 * 60);
         const pause = parseInt(row.pause, 10) || 0;
         const netMin = Math.max(0, eMin - sMin - pause);
-        const targetMin = Math.round((data.dayTargets[d] || (d === 'fr' ? 6.0 : 7.75)) * 60);
+        // Soll aus derselben Zeile wie Tab 3 - sonst weicht der Saldo im
+        // Markdown vom Gleitzeitkonto ab.
+        const targetMin = Math.round((typeof row.target === 'number' ? row.target : (d === 'fr' ? 6.0 : 7.75)) * 60);
         const diffMin = netMin - targetMin;
 
         sumIstMin += netMin;
@@ -8306,7 +8661,7 @@ ${tagsList.join('\n')}
         notes: data.notes,
         av: data.av,
         archived: data.archived || false,
-        weekLog: worktime.weekLog || null
+        weekLog: DAY_KEYS.reduce((o, d) => { o[d] = peekWorkDayRow(d, kw, yr); return o; }, {})
       };
       md += `<!-- COCKPIT_RAW_STATE: ${JSON.stringify(rawState)} -->\n`;
 
@@ -8373,7 +8728,7 @@ ${tagsList.join('\n')}
       if (cfg.autoSyncOnedrive === false || !cfg.onedriveFolderName || !window.showDirectoryPicker) return false;
       try {
         const kw = planner.selectedKw;
-        const yr = planner.selectedYear || 2026;
+        const yr = planner.selectedYear || defaultPlannerYear();
         const md = generateWeekMarkdown(kw, yr);
         return await writeMarkdownToLocalDir(kw, yr, md);
       } catch(e) {
@@ -8423,7 +8778,7 @@ ${tagsList.join('\n')}
     }
 
     // Download single week as .md file directly in browser
-    function downloadWeekMarkdown(kw, yr = (planner.selectedYear || 2026)) {
+    function downloadWeekMarkdown(kw, yr = (planner.selectedYear || defaultPlannerYear())) {
       const md = generateWeekMarkdown(kw, yr);
       const filename = `KW${String(kw).padStart(2, '0')}_${yr}.md`;
       const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
@@ -8435,7 +8790,7 @@ ${tagsList.join('\n')}
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
-      notify('success', `Berichtsheft <strong>${filename}</strong> heruntergeladen.`);
+      notify('success', html`Berichtsheft <strong>${filename}</strong> heruntergeladen.`);
     }
 
     // =========================================================================
@@ -8507,16 +8862,20 @@ ${tagsList.join('\n')}
     }
 
     // --- 2. Snapshot-Payload bauen & anwenden ---
-    function buildStateSnapshot(includeToken = true) {
+    // Snapshots enthalten NIE das Token - auch nicht in der IndexedDB. Es
+    // liegt getrennt unter AUTH_KEY: so laesst es sich gezielt loeschen,
+    // statt in bis zu 20 Historien-Snapshots weiterzuleben. (Der Parameter
+    // bleibt nur fuer die alten Aufrufer stehen.)
+    function buildStateSnapshot(includeToken = false) {
       const safeCfg = { ...cfg };
-      if (!includeToken) delete safeCfg.token;
+      delete safeCfg.token;
       return {
         app: 'Ausbildungs-Cockpit',
         version: '6.0',
         kind: 'local-snapshot',
         savedAt: new Date().toISOString(),
         activeKw: planner.selectedKw,
-        activeYear: planner.selectedYear || 2026,
+        activeYear: planner.selectedYear || defaultPlannerYear(),
         cfg: safeCfg,
         planner: planner,
         worktime: worktime,
@@ -8534,14 +8893,20 @@ ${tagsList.join('\n')}
     function applyStateSnapshot(snap, { rerender = true, restoreToken = true } = {}) {
       if (!snap || !snap.planner) return false;
 
-      planner = snap.planner;
-      if (!planner.weeks) planner.weeks = {};
-      if (!planner.selectedKw) planner.selectedKw = getCalendarWeek();
+      // Snapshot und .cockpit_data.json sind Eingaenge wie jeder andere:
+      // erst bereinigen, dann uebernehmen.
+      const cleanPlanner = sanitizePlanner(snap.planner);
+      planner = {
+        selectedKw: cleanPlanner.selectedKw,
+        selectedYear: cleanPlanner.selectedYear || defaultPlannerYear(),
+        weeks: cleanPlanner.weeks
+      };
+      if (cleanPlanner.conflicts) planner.conflicts = cleanPlanner.conflicts;
 
-      if (snap.worktime) worktime = { ...worktime, ...snap.worktime };
-      if (snap.ihkProgress) ihkProgress = snap.ihkProgress;
+      if (snap.worktime) worktime = { ...worktime, ...sanitizeWorktime(snap.worktime) };
+      if (snap.ihkProgress) ihkProgress = sanitizeIhk(snap.ihkProgress);
       if (snap.cfg) {
-        const incoming = { ...snap.cfg };
+        const incoming = sanitizeCfg(snap.cfg);
         if (!restoreToken || !incoming.token) delete incoming.token;
         cfg = { ...cfg, ...incoming };
       }
@@ -8575,6 +8940,74 @@ ${tagsList.join('\n')}
       return true;
     }
 
+    // --- 2b. Token getrennt vom Snapshot ---
+    const AUTH_KEY = 'auth';
+    let lastAuthWritten = null;
+
+    // Nur auf ausdrueckliches Leeren des Tokens in den Einstellungen - nie
+    // automatisch, sonst loeschte ein leerer localStorage (GPO) die einzige
+    // Kopie gleich mit.
+    function deleteAuthFromIdb() {
+      lastAuthWritten = null;
+      return queueIdbWrite(async () => {
+        const db = await openSnapshotDb();
+        await idbDelete(db, AUTH_KEY);
+        db.close();
+      }).catch(() => {});
+    }
+
+    // Fehlt das Token im localStorage (GPO-Wipe), aus der IndexedDB holen.
+    async function restoreAuthFromIdb() {
+      if (cfg.token) return false;
+      try {
+        const db = await openSnapshotDb();
+        const auth = await idbGet(db, AUTH_KEY);
+        db.close();
+        if (!auth || typeof auth.token !== 'string') return false;
+        const clean = sanitizeCfg({ token: auth.token, repo: auth.repo });
+        if (!clean.token) return false;
+        cfg.token = clean.token;
+        if (!cfg.repo && clean.repo) cfg.repo = clean.repo;
+        lastAuthWritten = cfg.token;
+        try { localStorage.setItem(KEY_CFG, JSON.stringify(cfg)); } catch(e) {}
+        const tInp = document.getElementById('cfgToken');
+        const rInp = document.getElementById('cfgRepo');
+        if (tInp) tInp.value = cfg.token;
+        if (rInp) rInp.value = cfg.repo || '';
+        return true;
+      } catch(e) {
+        return false;
+      }
+    }
+
+    // Einmalig: Tokens aus allen bereits vorhandenen Snapshots entfernen
+    // (latest, snap_*, pre_migration_*). Das juengste gefundene Token wandert
+    // vorher nach AUTH_KEY, falls dort noch keins liegt.
+    function stripTokensFromSnapshots() {
+      return queueIdbWrite(async () => {
+        const db = await openSnapshotDb();
+        try {
+          if (await idbGet(db, 'migr_token_strip_v1')) return;
+          const keys = (await idbKeys(db)).filter(k => typeof k === 'string' && (k === SNAP_LATEST_KEY || k.startsWith('snap_') || k.startsWith('pre_migration')));
+          let found = null;
+          for (const k of keys) {
+            const snap = await idbGet(db, k);
+            if (snap && snap.cfg && snap.cfg.token) {
+              if (!found || k === SNAP_LATEST_KEY) found = { token: snap.cfg.token, repo: snap.cfg.repo || '' };
+              delete snap.cfg.token;
+              await idbPut(db, k, snap);
+            }
+          }
+          if (found && !(await idbGet(db, AUTH_KEY))) {
+            await idbPut(db, AUTH_KEY, { token: found.token, repo: found.repo, at: new Date().toISOString() });
+          }
+          await idbPut(db, 'migr_token_strip_v1', { at: new Date().toISOString() });
+        } finally {
+          db.close();
+        }
+      }).catch(e => console.warn('[Auth] Token-Bereinigung der Snapshots:', e));
+    }
+
     // --- 3. Snapshot schreiben (latest + rollierende Historie) ---
     // Alle IndexedDB-Schreibvorgaenge laufen - wie die Platte ueber
     // queueFsWrite - durch EINE Kette. Frueher gab ein zweiter Aufruf
@@ -8595,10 +9028,16 @@ ${tagsList.join('\n')}
       isSnapshotWriting = true;
       try {
         const db = await openSnapshotDb();
-        const snap = payload || buildStateSnapshot(true);
+        const snap = payload || buildStateSnapshot();
 
         // 'latest' ist immer topaktuell und die Quelle der Auto-Recovery.
         await idbPut(db, SNAP_LATEST_KEY, snap);
+
+        // Token getrennt sichern (fuer die GPO-Recovery), nur bei Aenderung.
+        if (cfg.token && cfg.token !== lastAuthWritten) {
+          await idbPut(db, AUTH_KEY, { token: cfg.token, repo: cfg.repo || '', at: new Date().toISOString() });
+          lastAuthWritten = cfg.token;
+        }
 
         // Zusaetzlich gedrosselte Wiederherstellungspunkte, damit die Historie
         // nicht bei jedem Tastendruck durchrotiert.
@@ -8664,14 +9103,14 @@ ${tagsList.join('\n')}
           return false;
         }
 
-        const payload = buildStateSnapshot(false);
+        const payload = buildStateSnapshot();
         const fileHandle = await rootHandle.getFileHandle(LOCAL_BACKUP_FILE, { create: true });
         const writable = await fileHandle.createWritable();
         await writable.write(JSON.stringify(payload, null, 2));
         await writable.close();
         lastLocalSaveTime = new Date();
         if (!silent) {
-          notify('success', 'Lokales Vollbackup <strong>' + LOCAL_BACKUP_FILE + '</strong> geschrieben ✓');
+          notify('success', html`Lokales Vollbackup <strong>${LOCAL_BACKUP_FILE}</strong> geschrieben ✓`);
         }
         notePersistence('disk', true, null);
         updateLocalBackupStatusUI();
@@ -8713,7 +9152,7 @@ ${tagsList.join('\n')}
 
     // Sofortiges Sichern (z. B. beim Schliessen des Fensters)
     async function persistLocalStateNow() {
-      const ok = await writeSnapshotToIdb(buildStateSnapshot(true));
+      const ok = await writeSnapshotToIdb(buildStateSnapshot());
       updateLocalBackupStatusUI();
       return ok;
     }
@@ -8936,7 +9375,7 @@ ${tagsList.join('\n')}
     // geraetebezogen und haben im Repository nichts verloren.
     function buildDraftPayload() {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
 
       const safeCfg = syncedCfgSubset(cfg);
       safeCfg.setupDone = !!cfg.setupDone;
@@ -8969,24 +9408,29 @@ ${tagsList.join('\n')}
       try {
         if (typeof window === 'undefined' || !window.location || !window.location.hash || window.location.hash.length < 2) return;
         const hashParams = new URLSearchParams(window.location.hash.substring(1));
-        let changed = false;
         const hashToken = hashParams.get('token');
         const hashRepo = hashParams.get('repo');
-        if (hashToken && (!cfg.token || cfg.token.trim() === '')) {
-          cfg.token = hashToken.trim();
-          changed = true;
-        }
-        if (hashRepo && (!cfg.repo || cfg.repo.trim() === '')) {
-          cfg.repo = hashRepo.trim();
-          changed = true;
-        }
+        // Laeuft VOR loadSettings(): deshalb am gespeicherten Stand ergaenzen,
+        // nicht am noch leeren In-Memory-cfg - sonst wuerden die gespeicherten
+        // Einstellungen mit dem Werkszustand ueberschrieben. Nur gueltige
+        // Werte, und nur wenn noch nichts hinterlegt ist.
+        const clean = sanitizeCfg({ token: hashToken || undefined, repo: hashRepo || undefined });
+        const stored = readStoredJson(KEY_CFG) || {};
+        let changed = false;
+        if (clean.token && !stored.token) { stored.token = clean.token; changed = true; }
+        if (clean.repo && !stored.repo) { stored.repo = clean.repo; changed = true; }
         if (changed) {
-          localStorage.setItem(KEY_CFG, JSON.stringify(cfg));
-          const tInp = document.getElementById('cfgToken');
-          const rInp = document.getElementById('cfgRepo');
-          if (tInp) tInp.value = cfg.token;
-          if (rInp) rInp.value = cfg.repo;
+          localStorage.setItem(KEY_CFG, JSON.stringify(stored));
           console.info('[Auth] Credentials recovered from URL hash fallback.');
+        }
+        // Zugangsdaten sofort aus der Adresse entfernen - egal ob uebernommen
+        // oder nicht. Sonst bleibt das Token in Adressleiste, Verlauf,
+        // synchronisiertem Browserverlauf und Lesezeichen stehen.
+        if (hashToken || hashRepo) {
+          hashParams.delete('token');
+          hashParams.delete('repo');
+          const rest = hashParams.toString();
+          history.replaceState(null, '', location.pathname + location.search + (rest ? '#' + rest : ''));
         }
       } catch(e) {
         console.warn('[Auth] Hash fallback parse note:', e);
@@ -9096,14 +9540,14 @@ ${tagsList.join('\n')}
 
       try {
         // Stufe A: IndexedDB Snapshot (GPO-Schutz, laeuft immer)
-        await writeSnapshotToIdb(buildStateSnapshot(true));
+        await writeSnapshotToIdb(buildStateSnapshot());
         updateLocalBackupStatusUI();
 
         // Stufe B: Lokale Festplatte (aktive KW als Obsidian/OneDrive Markdown)
         if (cfg.autoSyncOnedrive !== false && cfg.onedriveFolderName && window.showDirectoryPicker) {
           try {
             const kw = planner.selectedKw;
-            const yr = planner.selectedYear || 2026;
+            const yr = planner.selectedYear || defaultPlannerYear();
             const md = generateWeekMarkdown(kw, yr);
             await writeMarkdownToLocalDir(kw, yr, md);
           } catch(e) {
@@ -9258,13 +9702,14 @@ ${tagsList.join('\n')}
       const seen = new Set();
       const out = [];
       list.forEach(f => {
-        if (!f || typeof f.path !== 'string' || typeof f.id !== 'string') return;
-        if (!/^f_[a-z0-9]{2,32}$/i.test(f.id) || seen.has(f.id)) return;
+        if (!f || typeof f.path !== 'string') return;
         const path = normalizeFolderPath(f.path);
         if (folderPathFormatError(path)) return;
-        seen.add(f.id);
+        // Ungueltige oder doppelte id: neu vergeben statt den Reiter zu verwerfen
+        const id = (typeof f.id === 'string' && /^f_[a-z0-9]{2,32}$/i.test(f.id) && !seen.has(f.id)) ? f.id : newFolderId();
+        seen.add(id);
         out.push({
-          id: f.id,
+          id,
           label: String(f.label || path.split('/').pop()).slice(0, 24),
           path,
           backend: 'github',
@@ -9338,7 +9783,15 @@ ${tagsList.join('\n')}
     // Fuehrt remoteDraft in den LIVE-State zusammen (mutiert planner,
     // worktime, ihkProgress, cfg an Ort und Stelle) und merkt sich die
     // Remote-Fassung als neue Basis.
-    function mergeRemoteIntoLocal(remoteDraft, remoteSha) {
+    function mergeRemoteIntoLocal(rawRemoteDraft, remoteSha) {
+      // Der Cloud-Entwurf ist fremde Eingabe (jeder mit Schreibrecht im Repo):
+      // bereinigen, bevor irgendetwas davon in den State oder ins DOM kommt.
+      const remoteDraft = {
+        planner: sanitizePlanner(rawRemoteDraft.planner),
+        worktime: sanitizeWorktime(rawRemoteDraft.worktime),
+        ihkProgress: sanitizeIhk(rawRemoteDraft.ihkProgress),
+        cfg: sanitizeCfg(rawRemoteDraft.cfg)
+      };
       const base = currentSyncBase();
       // Basis ZUERST aus der Remote-Fassung berechnen - danach haengen deren
       // Objekte teils im lokalen State und koennten weiter veraendert werden.
@@ -9486,8 +9939,8 @@ ${tagsList.join('\n')}
 
     function notifyWeekConflicts(keys) {
       if (!keys || !keys.length) return;
-      const list = keys.map(k => escapeHtml(weekKeyLabel(k))).join(', ');
-      notify('warning', `Parallele Änderung in <strong>${list}</strong> – beide Fassungen sind gesichert. Im Planer auswählen, welche gilt.`);
+      const list = keys.map(k => weekKeyLabel(k)).join(', ');
+      notify('warning', html`Parallele Änderung in <strong>${list}</strong> – beide Fassungen sind gesichert. Im Planer auswählen, welche gilt.`);
     }
 
     // Nach einem Merge: lokal sichern, neu zeichnen, Push-Bedarf markieren.
@@ -9599,7 +10052,7 @@ ${tagsList.join('\n')}
           const baseAtBuild = computeSyncBase(null, payload);
 
           const body = {
-            message: `Cloud-Auto-Save Entwurf (KW ${planner.selectedKw} ${planner.selectedYear || 2026})`,
+            message: `Cloud-Auto-Save Entwurf (KW ${planner.selectedKw} ${planner.selectedYear || defaultPlannerYear()})`,
             content: encodeUtf8Base64(jsonString)
           };
           const shaSent = cloudDraftSha;
@@ -9626,7 +10079,7 @@ ${tagsList.join('\n')}
             else updateCloudSyncUI('synced');
 
             if (conflictKeys.length) notifyWeekConflicts(conflictKeys);
-            else if (force) notify('success', hasLocal ? 'Entwurf in GitHub &amp; OneDrive/Obsidian gesichert ✓' : 'Entwurf erfolgreich in GitHub gesichert ✓');
+            else if (force) notify('success', hasLocal ? 'Entwurf in GitHub & OneDrive/Obsidian gesichert ✓' : 'Entwurf erfolgreich in GitHub gesichert ✓');
             return;
           }
 
@@ -9663,7 +10116,7 @@ ${tagsList.join('\n')}
         } else {
           updateCloudSyncUI('error', 'Sync-Fehler', `Fehler: ${msg}. Klicken für Retry.`);
         }
-        if (force) notify('error', 'Cloud-Sync fehlgeschlagen: ' + escapeHtml(msg));
+        if (force) notify('error', 'Cloud-Sync fehlgeschlagen: ' + msg);
         if (conflictKeys.length) notifyWeekConflicts(conflictKeys);
       } finally {
         isCloudDraftSyncing = false;
@@ -9951,16 +10404,9 @@ ${tagsList.join('\n')}
                     const filename = pathParts.pop();
                     const folder = pathParts.length > 1 ? pathParts[1] : '';
 
-                    let detectedYr = 2026;
-                    if (m[2]) {
-                      detectedYr = parseInt(m[2], 10);
-                    } else if (folder === 'Ausbildungsjahr_1') {
-                      detectedYr = kwNum >= 36 ? 2026 : 2027;
-                    } else if (folder === 'Ausbildungsjahr_2') {
-                      detectedYr = kwNum >= 36 ? 2027 : 2028;
-                    } else if (folder === 'Ausbildungsjahr_3') {
-                      detectedYr = kwNum >= 36 ? 2028 : 2029;
-                    }
+                    // Jahr aus dem Dateinamen, sonst aus Ordner + Zeitraum
+                    const detectedYr = m[2] ? parseInt(m[2], 10) : yearForTrainingFolder(kwNum, folder);
+                    if (!detectedYr) return;
 
                     tempSet.add(`${detectedYr}_${kwNum}`);
                     const fileMeta = {
@@ -9987,7 +10433,9 @@ ${tagsList.join('\n')}
 
         // 2. Fallback: Traditioneller Folder-Scan via Contents API
         if (!treeLoaded) {
-          const folders = ['Ausbildungsjahr_1', 'Ausbildungsjahr_2', 'Ausbildungsjahr_3'];
+          const lastInfo = getTrainingWeekInfo(getIsoWeekYear(trainingEndDate()).week, getIsoWeekYear(trainingEndDate()).year);
+          const nYears = Math.max(3, lastInfo.yearNumber || 0);
+          const folders = Array.from({ length: nYears }, (_, i) => `Ausbildungsjahr_${i + 1}`);
           await Promise.all(folders.map(async (folder) => {
             try {
               const res = await fetch(`https://api.github.com/repos/${cfg.repo}/contents/${BERICHTSHEFT_ROOT}/${folder}`, {
@@ -10000,16 +10448,8 @@ ${tagsList.join('\n')}
                     const m = f.name.match(/KW(\d+)(?:_(\d{4}))?/i);
                     if (m) {
                       const kwNum = parseInt(m[1], 10);
-                      let detectedYr = 2026;
-                      if (m[2]) {
-                        detectedYr = parseInt(m[2], 10);
-                      } else if (folder === 'Ausbildungsjahr_1') {
-                        detectedYr = kwNum >= 36 ? 2026 : 2027;
-                      } else if (folder === 'Ausbildungsjahr_2') {
-                        detectedYr = kwNum >= 36 ? 2027 : 2028;
-                      } else if (folder === 'Ausbildungsjahr_3') {
-                        detectedYr = kwNum >= 36 ? 2028 : 2029;
-                      }
+                      const detectedYr = m[2] ? parseInt(m[2], 10) : yearForTrainingFolder(kwNum, folder);
+                      if (!detectedYr) return;
                       tempSet.add(`${detectedYr}_${kwNum}`);
                       setArchiveIndexEntry(tempFilesMap, `${detectedYr}_${kwNum}`,
                         { folder, filename: f.name, path: f.path, sha: f.sha, size: f.size }, kwNum, detectedYr);
@@ -10032,50 +10472,64 @@ ${tagsList.join('\n')}
       }
     }
 
+    // Jahres-Pills aus dem Ausbildungszeitraum statt fester 2026-2029
+    function renderRadarYearPills() {
+      const box = document.getElementById('radarYearPills');
+      if (!box) return;
+      const r = trainingYearRange();
+      const years = [];
+      for (let y = r.first; y <= r.last; y++) years.push(y);
+      const sig = years.join(',');
+      if (box.dataset.years !== sig) {
+        box.dataset.years = sig;
+        box.innerHTML = years.map(y => `<button class="folder-pill" data-ryear="${y}">${y}</button>`).join('');
+      }
+      updateRadarYearPillsUI();
+    }
+
     async function renderSidebarRadar() {
       await scanGithubWeeks();
       const container = document.getElementById('sidebarQuartersContainer');
       if (!container) return;
       container.innerHTML = '';
 
-      const radarYear = planner.selectedYear || 2026;
-      updateRadarYearPillsUI();
+      const radarYear = planner.selectedYear || defaultPlannerYear();
+      const weeksInYear = weeksInIsoYear(radarYear);
+      renderRadarYearPills();
 
-      // Update radar header title and subtitle
+      // Kopfzeile: welche Ausbildungsjahre beruehrt dieses Kalenderjahr?
       const rTitle = document.getElementById('radarYearTitle');
       const rSub = document.getElementById('radarYearSub');
       if (rTitle && rSub) {
-        if (radarYear === 2026) {
-          rTitle.textContent = '1. Ausbildungsjahr (Start)';
-          rSub.textContent = '2026 (KW 36–52: Woche 1–17)';
-        } else if (radarYear === 2027) {
-          rTitle.textContent = '1. & 2. Ausbildungsjahr';
-          rSub.textContent = '2027 (KW 1–35: Woche 18–52)';
-        } else if (radarYear === 2028) {
-          rTitle.textContent = '2. & 3. Ausbildungsjahr';
-          rSub.textContent = '2028 (KW 1–52)';
-        } else if (radarYear >= 2029) {
-          rTitle.textContent = '3. Ausbildungsjahr (Abschluss)';
-          rSub.textContent = '2029 (Abschlussprüfungen)';
+        const inTraining = [];
+        for (let kw = 1; kw <= weeksInYear; kw++) {
+          const info = getTrainingWeekInfo(kw, radarYear);
+          if (!info.isPreStart && !info.isPostEnd) inTraining.push({ kw, info });
+        }
+        if (!inTraining.length) {
+          rTitle.textContent = 'Außerhalb der Ausbildung';
+          rSub.textContent = `${radarYear} (${weeksInYear} KW)`;
+        } else {
+          const nums = [...new Set(inTraining.map(x => x.info.yearNumber))];
+          const first = inTraining[0];
+          const last = inTraining[inTraining.length - 1];
+          rTitle.textContent = nums.map(n => n + '.').join(' & ') + ' Ausbildungsjahr'
+            + (first.info.totalWeeks === 1 ? ' (Start)' : '');
+          rSub.textContent = `${radarYear} (KW ${first.kw}–${last.kw}: Woche ${first.info.weekInYear}–${last.info.weekInYear})`;
         }
       }
 
-      const today = new Date();
-      const currentRealYear = today.getFullYear();
-      const currentRealKw = getCalendarWeek(today);
+      // Vergangenheit im ISO-Wochenjahr bemessen (KW53/2026 liegt teils in 2027)
+      const todayIso = getIsoWeekYear(new Date());
+      const currentRealYear = todayIso.year;
+      const currentRealKw = todayIso.week;
 
       const quarters = [
         { name: `Q1 · KW 1–13`, hint: `Q1 – Januar bis März ${radarYear} (KW 1–13)`, start: 1, end: 13 },
         { name: `Q2 · KW 14–26`, hint: `Q2 – April bis Juni ${radarYear} (KW 14–26)`, start: 14, end: 26 },
         { name: `Q3 · KW 27–39`, hint: `Q3 – Juli bis September ${radarYear} (KW 27–39)`, start: 27, end: 39 },
-        { name: `Q4 · KW 40–52`, hint: `Q4 – Oktober bis Dezember ${radarYear} (KW 40–52)`, start: 40, end: 52 }
+        { name: `Q4 · KW 40–${weeksInYear}`, hint: `Q4 – Oktober bis Dezember ${radarYear} (KW 40–${weeksInYear})`, start: 40, end: weeksInYear }
       ];
-
-      let startKw = 1;
-      if (cfg.startDate) {
-        const sD = new Date(cfg.startDate);
-        if (!isNaN(sD.getTime())) startKw = getCalendarWeek(sD);
-      }
 
       let cntArchived = 0;
       let cntMissing = 0;
@@ -10099,7 +10553,7 @@ ${tagsList.join('\n')}
           const weekInfo = getTrainingWeekInfo(kw, radarYear);
           tile.title = `KW ${kw} (${dates.shortRange}${radarYear}) • ${weekInfo.detailedLabel}`;
 
-          if (kw === planner.selectedKw && radarYear === (planner.selectedYear || 2026)) {
+          if (kw === planner.selectedKw && radarYear === (planner.selectedYear || defaultPlannerYear())) {
             tile.classList.add('selected');
           }
 
@@ -10118,7 +10572,7 @@ ${tagsList.join('\n')}
             if (hasLocalDraft) {
               tile.classList.add('draft');
               cntDraft++;
-            } else if (radarYear === 2026 && kw < startKw) {
+            } else if (weekInfo.isPreStart || weekInfo.isPostEnd) {
               tile.classList.add('pre-start');
             } else if (isPastWeek) {
               tile.classList.add('missing');
@@ -10127,7 +10581,7 @@ ${tagsList.join('\n')}
           }
 
           tile.addEventListener('click', async () => {
-            const sameWeek = (planner.selectedKw === kw && (planner.selectedYear || 2026) === radarYear);
+            const sameWeek = (planner.selectedKw === kw && (planner.selectedYear || defaultPlannerYear()) === radarYear);
             planner.selectedKw = kw;
             planner.selectedYear = radarYear;
             savePlannerState();
@@ -10155,11 +10609,11 @@ ${tagsList.join('\n')}
         container.appendChild(qSection);
       });
 
-      const selDates = getKwDates(planner.selectedKw, planner.selectedYear || 2026);
-      const selWeekInfo = getTrainingWeekInfo(planner.selectedKw, planner.selectedYear || 2026);
+      const selDates = getKwDates(planner.selectedKw, planner.selectedYear || defaultPlannerYear());
+      const selWeekInfo = getTrainingWeekInfo(planner.selectedKw, planner.selectedYear || defaultPlannerYear());
       const rangeEl = document.getElementById('miniRadarActiveRange');
       if (rangeEl) {
-        rangeEl.textContent = `KW ${planner.selectedKw} (${selDates.shortRange}${planner.selectedYear || 2026}) • ${selWeekInfo.label}`;
+        rangeEl.textContent = `KW ${planner.selectedKw} (${selDates.shortRange}${planner.selectedYear || defaultPlannerYear()}) • ${selWeekInfo.label}`;
       }
 
       document.getElementById('miniRadarStatArchived').textContent = `${cntArchived} archiviert`;
@@ -10201,7 +10655,7 @@ ${tagsList.join('\n')}
 
     function hasDayDuplicates(day) {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const data = getWeekData(kw, yr);
       const tasks = data.days[day] || [];
       if (tasks.length < 2) return false;
@@ -10218,7 +10672,7 @@ ${tagsList.join('\n')}
 
     function deduplicateDay(day) {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const data = getWeekData(kw, yr);
       const tasks = data.days[day] || [];
       if (tasks.length < 2) {
@@ -10269,7 +10723,7 @@ ${tagsList.join('\n')}
 
     function deduplicateWeek() {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const data = getWeekData(kw, yr);
 
       const days = ['mo', 'di', 'mi', 'do', 'fr'];
@@ -10328,7 +10782,7 @@ ${tagsList.join('\n')}
 
     function toggleTaskTransferred(day, id) {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const data = getWeekData(kw, yr);
       const t = (data.days[day] || []).find(item => item.id === id);
       if (!t) return;
@@ -10345,7 +10799,7 @@ ${tagsList.join('\n')}
 
     function markWeekAsTransferred(transferred = true) {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const data = getWeekData(kw, yr);
       const timeStr = new Date().toLocaleString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
 
@@ -10405,7 +10859,7 @@ ${tagsList.join('\n')}
 
     function applyDayPreset(day, presetType) {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const data = ensureWeekData(kw, yr);
       if (!data.dayPresets) data.dayPresets = { mo: null, di: null, mi: null, do: null, fr: null };
 
@@ -10457,7 +10911,7 @@ ${tagsList.join('\n')}
 
     function resetDayPreset(day) {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const data = getWeekData(kw, yr);
       if (!data.dayPresets || !data.dayPresets[day]) return;
 
@@ -10503,7 +10957,7 @@ ${tagsList.join('\n')}
 
     window.resolveWeekConflict = function(useRemote) {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const key = getWeekStorageKey(kw, yr);
       const c = planner.conflicts && planner.conflicts[key];
       if (!c) return;
@@ -10534,7 +10988,7 @@ ${tagsList.join('\n')}
         isPlannerLoading = opts.loading;
       }
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       let data = getWeekData(kw, yr);
       const dates = getKwDates(kw, yr);
       const weekInfo = getTrainingWeekInfo(kw, yr);
@@ -10780,10 +11234,10 @@ ${tagsList.join('\n')}
             }
 
             const typeTitles = { B: 'Betriebliche Tätigkeit', S: 'Berufsschule', U: 'Urlaub', F: 'Feiertag', K: 'Krank' };
-            const timeBadge = t.timeStr ? `<span class="task-timestamp" title="Erfasst um ${t.timeStr} Uhr">${t.timeStr}</span>` : '';
+            const timeBadge = t.timeStr ? `<span class="task-timestamp" title="Erfasst um ${escapeHtml(t.timeStr)} Uhr">${escapeHtml(t.timeStr)}</span>` : '';
             const statusBtn = t.transferred
-              ? `<button type="button" class="task-status-btn transferred" onclick="toggleTaskTransferred('${d}', ${t.id})" title="Übertragen am ${escapeHtml(t.transferredAt || '')} – klicken zum Zurücksetzen" aria-label="Als offen markieren">✓</button>`
-              : `<button type="button" class="task-status-btn" onclick="toggleTaskTransferred('${d}', ${t.id})" title="Offen – klicken, wenn ans Berichtsheft übergeben" aria-label="Als übertragen markieren">○</button>`;
+              ? `<button type="button" class="task-status-btn transferred" onclick="toggleTaskTransferred('${d}', ${jsArg(t.id)})" title="Übertragen am ${escapeHtml(t.transferredAt || '')} – klicken zum Zurücksetzen" aria-label="Als offen markieren">✓</button>`
+              : `<button type="button" class="task-status-btn" onclick="toggleTaskTransferred('${d}', ${jsArg(t.id)})" title="Offen – klicken, wenn ans Berichtsheft übergeben" aria-label="Als übertragen markieren">○</button>`;
 
             // Eine schlanke Zeile: Typ, Text, Zeit | Stunden, Status, Hover-Aktionen
             li.innerHTML = `
@@ -10796,8 +11250,8 @@ ${tagsList.join('\n')}
                 <span class="task-hours">${fmtH(t.hours)} h</span>
                 ${statusBtn}
                 <span class="task-actions">
-                  <button type="button" class="task-icon-btn" onclick="editPlannerTask('${d}', ${t.id})" title="Aufgabe bearbeiten" aria-label="Aufgabe bearbeiten">✎</button>
-                  <button type="button" class="task-icon-btn danger" onclick="delPlannerTask('${d}', ${t.id})" title="Aufgabe löschen" aria-label="Aufgabe löschen">✕</button>
+                  <button type="button" class="task-icon-btn" onclick="editPlannerTask('${d}', ${jsArg(t.id)})" title="Aufgabe bearbeiten" aria-label="Aufgabe bearbeiten">✎</button>
+                  <button type="button" class="task-icon-btn danger" onclick="delPlannerTask('${d}', ${jsArg(t.id)})" title="Aufgabe löschen" aria-label="Aufgabe löschen">✕</button>
                 </span>
               </span>
             `;
@@ -10846,7 +11300,7 @@ ${tagsList.join('\n')}
 
     function addPlannerQc(force = false) {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const data = ensureWeekData(kw, yr);
       const day = document.getElementById('plannerQcDay').value;
       const type = document.getElementById('plannerQcType').value;
@@ -10878,7 +11332,7 @@ ${tagsList.join('\n')}
 
     window.editPlannerTask = function(d, taskId) {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const data = getWeekData(kw, yr);
       const task = (data.days[d] || []).find(t => t.id === taskId);
       if (!task) return;
@@ -10892,10 +11346,10 @@ ${tagsList.join('\n')}
           <div style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem; flex-wrap:wrap;">
             <div style="display:flex; align-items:center; gap:0.35rem;">
               <span style="font-size:0.72rem; color:var(--text-secondary);">Stunden:</span>
-              <input type="number" id="editTaskHours_${taskId}" value="${task.hours}" step="0.25" min="0.25" max="10" style="width:65px; padding:0.25rem 0.4rem; font-size:0.8rem; border-radius:4px; background:var(--bg-input); border:1px solid var(--border-card); color:var(--text-primary);">
+              <input type="number" id="editTaskHours_${taskId}" value="${Number(task.hours) || 0}" step="0.25" min="0.25" max="10" style="width:65px; padding:0.25rem 0.4rem; font-size:0.8rem; border-radius:4px; background:var(--bg-input); border:1px solid var(--border-card); color:var(--text-primary);">
             </div>
             <div style="display:flex; gap:0.3rem;">
-              <button type="button" class="btn btn-sm btn-primary" onclick="saveEditedTask('${d}', ${taskId})">✓ Speichern</button>
+              <button type="button" class="btn btn-sm btn-primary" onclick="saveEditedTask('${d}', ${jsArg(taskId)})">✓ Speichern</button>
               <button type="button" class="btn btn-sm btn-ghost" onclick="renderPlanner()">✕ Abbrechen</button>
             </div>
           </div>
@@ -10921,7 +11375,7 @@ ${tagsList.join('\n')}
 
     window.saveEditedTask = function(d, taskId) {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const data = getWeekData(kw, yr);
       const task = (data.days[d] || []).find(t => t.id === taskId);
       if (!task) return;
@@ -10957,7 +11411,7 @@ ${tagsList.join('\n')}
 
     window.delPlannerTask = function(d, id) {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const data = getWeekData(kw, yr);
       const taskIndex = (data.days[d] || []).findIndex(t => t.id === id);
       if (taskIndex === -1) return;
@@ -10984,7 +11438,7 @@ ${tagsList.join('\n')}
 
     function clearPlannerWeek() {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const key = getWeekStorageKey(kw, yr);
       if (!confirm(`Woche ${kw} (${yr}) leeren?`)) return;
       const backup = JSON.parse(JSON.stringify(getWeekData(kw, yr)));
@@ -11009,7 +11463,7 @@ ${tagsList.join('\n')}
       });
     }
 
-    function buildCopilotPrompt(kw = planner.selectedKw, yr = (planner.selectedYear || 2026)) {
+    function buildCopilotPrompt(kw = planner.selectedKw, yr = (planner.selectedYear || defaultPlannerYear())) {
       const data = getWeekData(kw, yr);
       const weekInfo = getTrainingWeekInfo(kw, yr);
       const dates = getKwDates(kw, yr);
@@ -11082,7 +11536,7 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
     }
     window.buildCopilotPrompt = buildCopilotPrompt;
 
-    function buildDayExportText(day, kw = planner.selectedKw, yr = (planner.selectedYear || 2026)) {
+    function buildDayExportText(day, kw = planner.selectedKw, yr = (planner.selectedYear || defaultPlannerYear())) {
       const data = getWeekData(kw, yr);
       const dates = getKwDates(kw, yr);
       const target = data.dayTargets[day] || (day === 'fr' ? 6.0 : 7.75);
@@ -11143,7 +11597,7 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
 
     function openCopilotExportModal() {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       updateCopilotExportModalUI(kw, yr);
       switchCopilotExportView('modular');
 
@@ -11163,7 +11617,7 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
     // =========================================================================
     function compactDayText(day) {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const data = getWeekData(kw, yr);
       const prevTasks = JSON.parse(JSON.stringify(data.days[day] || []));
       const prevNotes = data.notes ? data.notes[day] : '';
@@ -11218,7 +11672,7 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
 
     function compactProcedureText() {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const data = getWeekData(kw, yr);
       if (!data.av) return;
       const prevAv = JSON.parse(JSON.stringify(data.av));
@@ -11253,7 +11707,7 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
     }
     window.compactProcedureText = compactProcedureText;
 
-    function updateCopilotExportModalUI(kw = planner.selectedKw, yr = (planner.selectedYear || 2026)) {
+    function updateCopilotExportModalUI(kw = planner.selectedKw, yr = (planner.selectedYear || defaultPlannerYear())) {
       const data = getWeekData(kw, yr);
       const dates = getKwDates(kw, yr);
       const weekInfo = getTrainingWeekInfo(kw, yr);
@@ -11270,8 +11724,9 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
 
       const hoursBadge = document.getElementById('copilotModalHoursBadge');
       if (hoursBadge) {
-        hoursBadge.textContent = `${fmtH(actualTotal)} / 37.00 h`;
-        hoursBadge.className = `badge-pill ${Math.abs(actualTotal - 37.0) < 0.05 ? 'success' : (actualTotal > 0 ? 'warning' : '')}`;
+        const weekTarget = DAY_KEYS.reduce((a, d) => a + (Number(data.dayTargets[d]) || 0), 0);
+        hoursBadge.textContent = `${fmtH(actualTotal)} / ${fmtH(weekTarget)} h`;
+        hoursBadge.className = `badge-pill ${Math.abs(actualTotal - weekTarget) < 0.05 ? 'success' : (actualTotal > 0 ? 'warning' : '')}`;
       }
 
       const modalBtnArchive = document.getElementById('btnCopilotArchiveWeek');
@@ -11317,8 +11772,8 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
           if (charCount > maxChars) {
             charBadgeCls = 'char-count-danger';
             charLabel = `⛔ ${charCount} / ${maxChars} Zeichen`;
-            compactBtnHtml = `<button class="btn-compact-text" onclick="compactDayText('${d}')" title="Kürzt Floskeln & Leerzeilen, um unter 1.000 Zeichen zu bleiben">✂️ Straffen</button>`;
-          } else if (charCount > 800) {
+            compactBtnHtml = `<button class="btn-compact-text" onclick="compactDayText('${d}')" title="Kürzt Floskeln & Leerzeilen, um unter ${maxChars} Zeichen zu bleiben">✂️ Straffen</button>`;
+          } else if (charCount > maxChars * 0.8) {
             charBadgeCls = 'char-count-warn';
             charLabel = `⚠️ ${charCount} / ${maxChars} Zeichen`;
           }
@@ -11359,7 +11814,7 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
                   <div style="display:flex; align-items:center; gap:0.3rem; flex-wrap:wrap;">
                     <span class="task-type-badge ${typeCls}" style="font-size:0.6rem;">${typeTxt}</span>
                     <span>${escapeHtml(t.text)}</span>
-                    ${t.timeStr ? `<span class="task-timestamp">• ${t.timeStr}</span>` : ''}
+                    ${t.timeStr ? `<span class="task-timestamp">• ${escapeHtml(t.timeStr)}</span>` : ''}
                   </div>
                   <strong style="font-family:var(--font-mono); color:var(--accent); font-size:0.75rem; flex-shrink:0;">${fmtH(t.hours)} h</strong>
                 </div>
@@ -11408,11 +11863,11 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
         let avLabel = `${avCount} / ${avMax} Zeichen`;
         let avCompactBtn = '';
 
-        if (avCount > 2000) {
+        if (avCount > avMax) {
           avBadgeCls = 'char-count-danger';
           avLabel = `⛔ ${avCount} / ${avMax} Zeichen`;
           avCompactBtn = `<button class="btn-compact-text" onclick="compactProcedureText()" title="Kürzt Floskeln & Leerzeilen">✂️ Straffen</button>`;
-        } else if (avCount > 1600) {
+        } else if (avCount > avMax * 0.8) {
           avBadgeCls = 'char-count-warn';
           avLabel = `⚠️ ${avCount} / ${avMax} Zeichen`;
         }
@@ -11470,7 +11925,7 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
 
     function copyExportProcedure() {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const data = getWeekData(kw, yr);
       const text = `WÖCHENTLICHER ARBEITSVORGANG (Fachbericht):\nThema: ${data.av?.title || 'Aus Wochenaufgaben ableiten'}\nDurchführung & Notizen:\n${data.av?.notes || 'Aus Wochenaufgaben formulieren'}\n`;
       const btn = document.getElementById('btnCopyExportAv');
@@ -11573,7 +12028,7 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
         return;
       }
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const data = ensureWeekData(kw, yr);
       const folder = getTrainingYearFolder(kw, yr);
       const kwPad = String(kw).padStart(2, '0');
@@ -11591,7 +12046,7 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
       }
 
       const md = generateWeekMarkdown(kw, yr);
-      notify('loading', `Archiviere ${escapeHtml(filename)}...`);
+      notify('loading', `Archiviere ${filename}...`);
 
       try {
         // 2. Remote-Stand pruefen. Die sha kommt NIE ungeprueft aus dem Netz:
@@ -11632,7 +12087,7 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
         // zwischen Pruefung und Schreiben geaendert wurde. Beim naechsten
         // Versuch greift die Rueckfrage oben.
         if (res.status === 409 || res.status === 422) {
-          notify('error', `${escapeHtml(filename)} wurde gerade parallel geändert. Bitte erneut archivieren – du wirst dann gefragt, welche Fassung gilt.`);
+          notify('error', `${filename} wurde gerade parallel geändert. Bitte erneut archivieren – du wirst dann gefragt, welche Fassung gilt.`);
           return;
         }
 
@@ -11660,15 +12115,15 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
           // Write simultaneously to local OneDrive / Obsidian folder
           const localOk = await writeMarkdownToLocalDir(kw, yr, md);
           const msg = localOk
-            ? `Berichtsheft ${escapeHtml(filename)} in GitHub &amp; OneDrive/Obsidian archiviert ✓`
-            : `Berichtsheft ${escapeHtml(filename)} in ${escapeHtml(folder)} archiviert ✓`;
+            ? `Berichtsheft ${filename} in GitHub & OneDrive/Obsidian archiviert ✓`
+            : `Berichtsheft ${filename} in ${folder} archiviert ✓`;
           notify('success', msg);
         } else {
           const errDetail = await res.text().catch(() => '');
           console.error('Archivierungs-Fehler:', res.status, errDetail);
-          notify('error', `Archivierung fehlgeschlagen (${res.status}: ${escapeHtml(res.statusText || 'GitHub API Fehler')})`);
+          notify('error', `Archivierung fehlgeschlagen (${res.status}: ${res.statusText || 'GitHub API Fehler'})`);
         }
-      } catch(e) { notify('error', escapeHtml(e.message)); }
+      } catch(e) { notify('error', e.message); }
     }
     window.saveWeekToGithub = saveWeekToGithub;
 
@@ -11693,7 +12148,7 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
 
     function initWorktime() {
       const s = localStorage.getItem(KEY_WORKTIME);
-      if (s) try { worktime = { ...worktime, ...JSON.parse(s) }; } catch(e){}
+      if (s) try { worktime = { ...worktime, ...sanitizeWorktime(JSON.parse(s)) }; } catch(e){}
 
       if (new Date().getDay() === 5 && (worktime.dayType === 'mo_do_775' || worktime.dayType === 'mo_do_8')) {
         worktime.dayType = 'freitag_6';
@@ -11823,63 +12278,93 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
       }
     }
 
-    function getWorkDayRow(d, kw = planner.selectedKw, yr = (planner.selectedYear || 2026)) {
-      // Das Soll einer neuen Woche kommt aus dem eingestellten Modell, nicht
-      // aus einem festen Tarifwert - sonst faellt jede neue Woche auf
-      // 7,75/6,0 zurueck, egal was eingestellt ist.
-      const modellTag = (worktime && worktime.weekLog && worktime.weekLog[d]) || null;
-      const defTarget = (modellTag && typeof modellTag.target === 'number')
-        ? modellTag.target
-        : (d === 'fr' ? 6.0 : 7.75);
-      const weekKey = `${yr}_KW${kw}`;
-      if (!worktime.weeks) worktime.weeks = {};
-      if (!worktime.weeks[weekKey]) {
-        worktime.weeks[weekKey] = JSON.parse(JSON.stringify(worktime.weekLog || {}));
-      }
-      if (!worktime.weeks[weekKey][d]) {
-        worktime.weeks[weekKey][d] = {
-          start: '07:00',
-          end: d === 'fr' ? '13:15' : '15:30',
-          pause: d === 'fr' ? 15 : 45,
-          target: defTarget
-        };
-      }
-      const row = worktime.weeks[weekKey][d];
-      if (!row.start) row.start = '07:00';
-      if (!row.end) row.end = (d === 'fr' ? '13:15' : '15:30');
-      if (row.pause === undefined || row.pause === null) row.pause = (d === 'fr' ? 15 : 45);
-      // Hier stand eine Dauerkorrektur: jedes Mo-Do-Soll von exakt 8,0 h
-      // wurde auf 7,75 zurueckgeschrieben, jeder Freitag mit 5,0 h auf 6,0 -
-      // eine Altlast der entfernten Optionen "mo_do_8" und "freitag_5".
-      // Sie machte ein 38,5- oder 40-Stunden-Modell unmoeglich: der Wert
-      // wurde bei jedem Rendern still wieder ueberschrieben.
-      if (!row.target) row.target = defTarget;
+    // =======================================================================
+    // ARBEITSZEIT-MODELL
+    // worktime.weekLog ist ausschliesslich die VORLAGE (Soll-Modell je
+    // Wochentag: Beginn, Pause, Soll). Frueher zeigte weekLog[d] per
+    // Zuweisung auf die Ist-Zeile der zuletzt gerenderten Woche - neue Wochen
+    // erbten dadurch deren Ist-Zeiten (z. B. Ueberstunden), und die
+    // Arbeitszeittabelle im Markdown zeigte fuer JEDE Woche dieselben Zeiten.
+    // Ist-Zeilen liegen nur in worktime.weeks['JJJJ_KWn'][d].
+    // =======================================================================
+    function wtKey(kw, yr) { return `${yr}_KW${kw}`; }
 
-      if (!worktime.weekLog) worktime.weekLog = {};
-      worktime.weekLog[d] = row;
+    // Vorgabezeile eines Wochentags aus der Vorlage. Das Ende wird aus
+    // Beginn + Soll + Pause berechnet, damit eine unberuehrte Woche genau
+    // 0,00 h Saldo hat.
+    function templateRow(d) {
+      const t = (worktime && worktime.weekLog && worktime.weekLog[d]) || {};
+      const target = (typeof t.target === 'number' && isFinite(t.target)) ? t.target : (d === 'fr' ? 6.0 : 7.75);
+      const start = (typeof t.start === 'string' && TIME_RE.test(t.start)) ? t.start : '07:00';
+      const pause = Number.isFinite(Number(t.pause)) ? parseInt(t.pause, 10) : (d === 'fr' ? 15 : 45);
+      return { start, end: endeAusSoll(start, target, pause), pause, target };
+    }
+
+    function templateDayTargets() {
+      const o = {};
+      DAY_KEYS.forEach(d => { o[d] = templateRow(d).target; });
+      return o;
+    }
+
+    function templateWeekHours() {
+      return DAY_KEYS.reduce((a, d) => a + templateRow(d).target, 0);
+    }
+
+    // Rein lesend: vorhandene Ist-Zeile oder die Vorgabe - legt nichts an.
+    function peekWorkDayRow(d, kw = planner.selectedKw, yr = (planner.selectedYear || defaultPlannerYear())) {
+      const wk = worktime.weeks && worktime.weeks[wtKey(kw, yr)];
+      const row = wk && wk[d];
+      if (!row) return templateRow(d);
+      const def = templateRow(d);
+      return {
+        start: row.start || def.start,
+        end: row.end || def.end,
+        pause: (row.pause === undefined || row.pause === null) ? def.pause : row.pause,
+        target: (typeof row.target === 'number') ? row.target : def.target,
+        edited: !!row.edited
+      };
+    }
+
+    // Fuer Schreiber (Eingabe in der Tabelle, Pausenautomatik, Import):
+    // legt die Zeile bei Bedarf aus der Vorlage an. Kein Aliasing mehr auf
+    // weekLog.
+    function getWorkDayRow(d, kw = planner.selectedKw, yr = (planner.selectedYear || defaultPlannerYear())) {
+      const key = wtKey(kw, yr);
+      if (!worktime.weeks) worktime.weeks = {};
+      if (!worktime.weeks[key]) worktime.weeks[key] = {};
+      if (!worktime.weeks[key][d]) worktime.weeks[key][d] = templateRow(d);
+      const row = worktime.weeks[key][d];
+      const def = templateRow(d);
+      if (!row.start) row.start = def.start;
+      if (!row.end) row.end = def.end;
+      if (row.pause === undefined || row.pause === null) row.pause = def.pause;
+      if (typeof row.target !== 'number') row.target = def.target;
       return row;
     }
 
-    function calcRowNetAndDiff(d, kw = planner.selectedKw, yr = (planner.selectedYear || 2026)) {
-      const row = getWorkDayRow(d, kw, yr);
-      const [sH, sM] = (row.start || '07:00').split(':').map(Number);
-      const [eH, eM] = (row.end || (d === 'fr' ? '13:15' : '15:30')).split(':').map(Number);
+    function rowNetHours(row, d) {
+      const [sH, sM] = String(row.start || '07:00').split(':').map(Number);
+      const [eH, eM] = String(row.end || (d === 'fr' ? '13:15' : '15:30')).split(':').map(Number);
       const startTotal = Math.max((isNaN(sH) ? 7 : sH) * 60 + (isNaN(sM) ? 0 : sM), 6 * 60);
       const endTotal = Math.min((isNaN(eH) ? 15 : eH) * 60 + (isNaN(eM) ? 30 : eM), 20 * 60);
       const spanMin = Math.max(0, endTotal - startTotal);
       const pauseVal = parseInt(row.pause, 10) || 0;
-      const netH = Math.max(0, spanMin - pauseVal) / 60;
-      const diff = netH - row.target;
-      return { row, netH, diff, target: row.target };
+      return Math.max(0, spanMin - pauseVal) / 60;
+    }
+
+    function calcRowNetAndDiff(d, kw = planner.selectedKw, yr = (planner.selectedYear || defaultPlannerYear())) {
+      const row = peekWorkDayRow(d, kw, yr);
+      const netH = rowNetHours(row, d);
+      return { row, netH, diff: netH - row.target, target: row.target };
     }
 
     function updateWorktimeTotals() {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
 
       let sumActual = 0;
       let sumTarget = 0;
-      ['mo', 'di', 'mi', 'do', 'fr'].forEach(d => {
+      DAY_KEYS.forEach(d => {
         const res = calcRowNetAndDiff(d, kw, yr);
         sumActual += res.netH;
         sumTarget += res.target;
@@ -11895,47 +12380,41 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
         bEl.className = `badge-pill ${bal >= 0 ? 'success' : 'warning'}`;
       }
 
-      // Compute cumulative overall balance across all recorded weeks in worktime.weeks
+      // Gesamtsaldo: nur Wochen zwischen Ausbildungsbeginn und heute. Frueher
+      // zaehlte jede je angezeigte Woche mit - auch zukuenftige und solche mit
+      // geerbten Fremdzeiten.
+      const fromMon = trainingYearStartMonday(1);
+      const toMon = mondayOf(new Date());
       let overallBalance = 0;
-      if (worktime.weeks && Object.keys(worktime.weeks).length > 0) {
-        for (const [wKey, wDays] of Object.entries(worktime.weeks)) {
-          let wAct = 0;
-          let wTgt = 0;
-          ['mo', 'di', 'mi', 'do', 'fr'].forEach(d => {
-            const r = wDays[d];
-            if (r) {
-              const [sH, sM] = (r.start || '07:00').split(':').map(Number);
-              const [eH, eM] = (r.end || (d === 'fr' ? '13:15' : '15:30')).split(':').map(Number);
-              const st = Math.max((isNaN(sH) ? 7 : sH) * 60 + (isNaN(sM) ? 0 : sM), 6 * 60);
-              const et = Math.min((isNaN(eH) ? 15 : eH) * 60 + (isNaN(eM) ? 30 : eM), 20 * 60);
-              const sp = Math.max(0, et - st);
-              const p = parseInt(r.pause, 10) || 0;
-              const n = Math.max(0, sp - p) / 60;
-              wAct += n;
-              wTgt += (r.target !== undefined ? r.target : (d === 'fr' ? 6.0 : 7.75));
-            }
-          });
-          overallBalance += (wAct - wTgt);
-        }
-      } else {
-        overallBalance = bal;
-      }
+      Object.entries(worktime.weeks || {}).forEach(([wKey, wDays]) => {
+        const m = /^(\d{4})_KW(\d{1,2})$/.exec(wKey);
+        if (!m || !wDays) return;
+        const mon = mondayOfIsoWeek(+m[2], +m[1]);
+        if (mon < fromMon || mon > toMon) return;
+        DAY_KEYS.forEach(d => {
+          const r = wDays[d];
+          if (!r) return;
+          const tgt = (typeof r.target === 'number') ? r.target : templateRow(d).target;
+          overallBalance += rowNetHours(r, d) - tgt;
+        });
+      });
 
       const ovEl = document.getElementById('worktimeOverallBalance');
       if (ovEl) {
         ovEl.textContent = `Gesamt: ${overallBalance >= 0 ? '+' : ''}${overallBalance.toFixed(2)} h`;
         ovEl.className = `badge-pill ${overallBalance >= 0 ? 'success' : 'warning'}`;
+        ovEl.title = 'Summe aller Wochen seit Ausbildungsbeginn bis heute';
       }
 
       const titleEl = document.getElementById('worktimeCardHeaderTitle');
       if (titleEl) {
-        titleEl.textContent = `Gleitzeitkonto (KW ${kw} ${yr} • Soll: 37,0 h)`;
+        titleEl.textContent = `Gleitzeitkonto (KW ${kw} ${yr} • Soll: ${fmtH(sumTarget).replace('.', ',')} h)`;
       }
     }
 
     function updateWorkDayRow(d) {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const res = calcRowNetAndDiff(d, kw, yr);
       const netEl = document.getElementById(`worktimeNet_${d}`);
       if (netEl) netEl.textContent = `${res.netH.toFixed(2)}h`;
@@ -11957,7 +12436,7 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
       if (!tbody) return;
 
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
 
       const existingRows = tbody.querySelectorAll('tr[data-day]');
       if (existingRows.length === 5) {
@@ -11992,9 +12471,9 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
         tr.id = `worktimeRow_${d}`;
         tr.innerHTML = `
           <td><strong>${dayLabels[d].slice(0, 2)}</strong></td>
-          <td><input type="time" id="worktimeStart_${d}" value="${res.row.start}"></td>
-          <td><input type="time" id="worktimeEnd_${d}" value="${res.row.end}"></td>
-          <td class="num"><input type="number" id="worktimePause_${d}" value="${res.row.pause}" min="0" max="120" step="5" style="width:50px;"> m</td>
+          <td><input type="time" id="worktimeStart_${d}" value="${escapeHtml(res.row.start)}"></td>
+          <td><input type="time" id="worktimeEnd_${d}" value="${escapeHtml(res.row.end)}"></td>
+          <td class="num"><input type="number" id="worktimePause_${d}" value="${Number(res.row.pause) || 0}" min="0" max="120" step="5" style="width:50px;"> m</td>
           <td class="num"><strong id="worktimeNet_${d}" style="font-family: var(--font-mono);">${res.netH.toFixed(2)}h</strong></td>
           <td class="num" id="worktimeTarget_${d}" style="color: var(--text-muted); font-family: var(--font-mono);">${fmtH(res.target)}h</td>
           <td class="num" id="worktimeDiff_${d}" style="font-family: var(--font-mono); font-weight: 600; color: ${res.diff >= 0 ? 'var(--success)' : 'var(--danger)'};">
@@ -12019,16 +12498,17 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
 
     window.changeWorkDay = function(d, field, val) {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const row = getWorkDayRow(d, kw, yr);
       row[field] = field === 'pause' ? (parseInt(val, 10) || 0) : val;
+      row.edited = true;
       saveWorktimeState();
       updateWorkDayRow(d);
     };
 
     function autoCalcWeekPauses() {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       ['mo', 'di', 'mi', 'do', 'fr'].forEach(d => {
         const row = getWorkDayRow(d, kw, yr);
         const isFr = (d === 'fr');
@@ -12038,6 +12518,7 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
         const endMin = Math.min(eH * 60 + eM, 20 * 60);
         const rawHours = Math.max(0, endMin - startMin) / 60;
         row.pause = calculatePause(isFr, startMin, rawHours).pause;
+        row.edited = true;
 
         const pInp = document.getElementById(`worktimePause_${d}`);
         if (pInp) pInp.value = row.pause;
@@ -12049,7 +12530,7 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
 
     function syncHoursToPlanner() {
       const kw = planner.selectedKw;
-      const yr = planner.selectedYear || 2026;
+      const yr = planner.selectedYear || defaultPlannerYear();
       const currentWeekData = ensureWeekData(kw, yr);
       ['mo', 'di', 'mi', 'do', 'fr'].forEach(d => {
         const res = calcRowNetAndDiff(d, kw, yr);
@@ -12066,7 +12547,7 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
     // =========================================================================
     function initIhk() {
       const s = localStorage.getItem(KEY_IHK);
-      if (s) try { ihkProgress = JSON.parse(s); } catch(e){}
+      if (s) try { ihkProgress = sanitizeIhk(JSON.parse(s)); } catch(e){}
       renderIhk();
     }
 
@@ -12137,70 +12618,70 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
       renderIhk();
     };
 
-    // Auto-Migration Engine (Compatibility for earlier prototypes & schema integrity)
+    // Auto-Migration alter Prototyp-Schluessel.
+    // WICHTIG: laeuft VOR loadSettings()/initPlanner(). Die frueheren
+    // Fassungen schrieben deshalb das noch nicht geladene In-Memory-Default
+    // zurueck - bei vorhandenem Alt-Schluessel wurde so bei JEDEM Start der
+    // gespeicherte Planer auf eine einzige Altwoche und die Einstellungen auf
+    // Werkszustand zurueckgesetzt. Jetzt wird direkt am gespeicherten Stand
+    // ergaenzt, und jede Migration laeuft genau einmal.
+    function readStoredJson(key) {
+      try { return JSON.parse(localStorage.getItem(key) || 'null'); } catch(e) { return null; }
+    }
+
     function runStorageMigration() {
       try {
-        // 1. Alter Prototyp-Key. Bleibt so stehen - er ist die Bruecke zu
-        // Bestandsdaten und darf nicht umbenannt werden.
+        // 1. Alter Planer-Key 'ebiza_planner_data_v1' -> eine Woche ergaenzen
         const legacyPlannerRaw = localStorage.getItem('ebiza_planner_data_v1');
-        if (legacyPlannerRaw) {
+        if (legacyPlannerRaw && !localStorage.getItem('cockpit_migr_legacy_planner')) {
           try {
             const leg = JSON.parse(legacyPlannerRaw);
-            const legKw = leg.kw || getCalendarWeek();
-            if (!planner.weeks[legKw]) {
-              planner.weeks[legKw] = {
+            const legKw = parseInt(leg.kw, 10) || getCalendarWeek();
+            const stored = readStoredJson(KEY_PLANNER) || {};
+            stored.weeks = stored.weeks || {};
+            const key = `2026_${legKw}`;
+            if (!stored.weeks[key] && !stored.weeks[legKw]) {
+              stored.weeks[key] = {
                 days: leg.days || { mo: [], di: [], mi: [], do: [], fr: [] },
-                dayTargets: { mo: 7.75, di: 7.75, mi: 7.75, do: 7.75, fr: 6.0 },
                 notes: { mo: '', di: '', mi: '', do: '', fr: '' },
                 av: { title: leg.arbeitsvorgang?.title || '', notes: leg.arbeitsvorgang?.notes || '' },
                 archived: false
               };
-              localStorage.setItem(KEY_PLANNER, JSON.stringify(planner));
-              console.info(`[Migration] Legacy v1 planner data for KW ${legKw} successfully migrated.`);
+              localStorage.setItem(KEY_PLANNER, JSON.stringify(stored));
+              console.info(`[Migration] Legacy v1 planner data for KW ${legKw} migrated.`);
             }
+            localStorage.setItem('cockpit_migr_legacy_planner', '1');
           } catch(e) {}
         }
 
-        // 2. Check legacy prototype: 'dropzone_config'
+        // 2. Alter Config-Key 'dropzone_config' -> Token/Repo nur, wenn der
+        //    gespeicherte Stand noch keins hat
         const legacyCfgRaw = localStorage.getItem('dropzone_config');
-        if (legacyCfgRaw && (!cfg.token || cfg.token === '')) {
+        if (legacyCfgRaw && !localStorage.getItem('cockpit_migr_legacy_cfg')) {
           try {
             const legCfg = JSON.parse(legacyCfgRaw);
-            if (legCfg.token) {
-              cfg.token = legCfg.token;
-              if (legCfg.repo) cfg.repo = legCfg.repo;
-              localStorage.setItem(KEY_CFG, JSON.stringify(cfg));
-              console.info('[Migration] Legacy v1 config token successfully migrated.');
+            const stored = readStoredJson(KEY_CFG) || {};
+            if (legCfg.token && !stored.token) {
+              stored.token = legCfg.token;
+              if (legCfg.repo && !stored.repo) stored.repo = legCfg.repo;
+              localStorage.setItem(KEY_CFG, JSON.stringify(stored));
+              console.info('[Migration] Legacy v1 config token migrated.');
             }
+            localStorage.setItem('cockpit_migr_legacy_cfg', '1');
           } catch(e) {}
         }
 
-        // 3. Check legacy worktime: 'worktime_calc_data_v1'
+        // 3. Alter Arbeitszeit-Key - nur, wenn es noch gar keinen neuen gibt
         const legacyWtRaw = localStorage.getItem('worktime_calc_data_v1');
         if (legacyWtRaw && !localStorage.getItem(KEY_WORKTIME)) {
           try {
             const legWt = JSON.parse(legacyWtRaw);
             if (legWt.start) worktime.start = legWt.start;
             localStorage.setItem(KEY_WORKTIME, JSON.stringify(worktime));
-            console.info('[Migration] Legacy v1 worktime successfully migrated.');
+            console.info('[Migration] Legacy v1 worktime migrated.');
           } catch(e) {}
         }
-
-        // 4. Schema Integrity for current planner.weeks
-        let schemaUpdated = false;
-        Object.values(planner.weeks || {}).forEach(w => {
-          if (!w.notes) { w.notes = { mo: '', di: '', mi: '', do: '', fr: '' }; schemaUpdated = true; }
-          if (!w.days) { w.days = { mo: [], di: [], mi: [], do: [], fr: [] }; schemaUpdated = true; }
-          if (!w.dayTargets) { w.dayTargets = { mo: 7.75, di: 7.75, mi: 7.75, do: 7.75, fr: 6.0 }; schemaUpdated = true; }
-          if (w.dayTargets.mo === 8.0) { w.dayTargets.mo = 7.75; schemaUpdated = true; }
-          if (w.dayTargets.di === 8.0) { w.dayTargets.di = 7.75; schemaUpdated = true; }
-          if (w.dayTargets.mi === 8.0) { w.dayTargets.mi = 7.75; schemaUpdated = true; }
-          if (w.dayTargets.do === 8.0) { w.dayTargets.do = 7.75; schemaUpdated = true; }
-          if (w.dayTargets.fr === 5.0) { w.dayTargets.fr = 6.0; schemaUpdated = true; }
-        });
-        if (schemaUpdated) {
-          localStorage.setItem(KEY_PLANNER, JSON.stringify(planner));
-        }
+        // Schema-Nachzug der Wochen: sanitizePlanner() in initPlanner().
       } catch(e) {
         console.warn('[Migration] Notice:', e);
       }
@@ -12391,6 +12872,10 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
       loadSettings();
       // Sync-Basis (zuletzt mit GitHub geteilte Fassung) vor jedem GitHub-Aufruf
       await loadSyncBase();
+      // Token-Hygiene: alte Snapshots bereinigen (einmalig), dann ggf. das
+      // Token aus seinem eigenen IndexedDB-Eintrag zurueckholen.
+      await stripTokensFromSnapshots();
+      if (await restoreAuthFromIdb()) console.info('[Auth] Token aus IndexedDB wiederhergestellt.');
 
       // Reiter aufbauen, BEVOR switchTab() fuer Tab 1 loadExplorerFiles() ruft
       renderFolderPills();
