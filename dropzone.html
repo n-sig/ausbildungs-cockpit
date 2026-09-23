@@ -4687,7 +4687,11 @@
     // Normalfall einer frischen Installation. Jeder GitHub-Pfad muss deshalb
     // beides pruefen - ein Token ohne Repo baut sonst Aufrufe gegen
     // /repos//contents/... und die schlagen mit einem irrefuehrenden 404 fehl.
-    function githubReady() { return !!(cfg.token && cfg.repo); }
+    // Auch das FORMAT zaehlt: ein halb eingetipptes Token oder ein Repo wie
+    // "a/../b" loeste frueher bei jeder Eingabepause echte API-Aufrufe aus.
+    const REPO_RE = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/;
+    const TOKEN_RE = /^[A-Za-z0-9_]{20,255}$/;
+    function githubReady() { return !!(cfg.token && cfg.repo && TOKEN_RE.test(cfg.token) && REPO_RE.test(cfg.repo)); }
 
     // =======================================================================
     // ORDNER-REGISTRY (Tab 1)
@@ -5825,9 +5829,13 @@
       }
       if (prev.token && !cfg.token) deleteAuthFromIdb();   // Token bewusst entfernt
       if (cfg.repo !== prev.repo) {
-        // Die Sync-Basis gehoert zu genau einem Repository.
+        // Sync-Basis und Archiv-Index gehoeren zu genau einem Repository.
         const b = currentSyncBase();
         cloudDraftSha = b ? b.sha : null;
+        cachedArchivedWeeks = new Set();
+        cachedArchivedFilesMap = new Map();
+        lastGitTreeEtag = null;
+        lastScanGithubWeeksTime = 0;
       }
       if (cfg.token !== prev.token || cfg.repo !== prev.repo) {
         loadExplorerFiles();
@@ -6662,8 +6670,28 @@
     function ghJsonHeaders() {
       return Object.assign(ghHeaders(), { 'Content-Type': 'application/json' });
     }
+    // Jedes Pfadsegment einzeln kodiert: ein '#' oder '?' im Dateinamen
+    // schnitt die URL frueher ab ("Notiz #3.png" -> Datei "Notiz "), und
+    // '..'-Segmente haetten andere API-Endpunkte erreicht.
+    function ghPath(path) {
+      return String(path || '').split('/').filter(seg => seg && seg !== '.' && seg !== '..').map(encodeURIComponent).join('/');
+    }
     function ghUrl(path) {
-      return `https://api.github.com/repos/${cfg.repo}/contents/${path}`;
+      return `https://api.github.com/repos/${cfg.repo}/contents/${ghPath(path)}`;
+    }
+
+    // Dateinamen fuer Upload/Umbenennen: keine Pfadtrenner, keine unter
+    // Windows verbotenen Zeichen, nichts, was ein lokaler Klon nicht
+    // anlegen koennte.
+    function fileNameError(name) {
+      const n = String(name || '');
+      if (!n.trim()) return 'Dateiname fehlt.';
+      if (n.length > 180) return 'Dateiname zu lang (max. 180 Zeichen).';
+      if (/[\\/:*?"<>|\x00-\x1f#]/.test(n)) return 'Dateiname enthält unzulässige Zeichen (\\ / : * ? " < > | #).';
+      if (/[. ]$/.test(n)) return 'Dateiname darf nicht auf Punkt oder Leerzeichen enden.';
+      if (n === '.' || n === '..' || /^\./.test(n)) return 'Dateiname darf nicht mit einem Punkt beginnen.';
+      if (FOLDER_WIN_RESERVED.test(n)) return 'Unter Windows reservierter Name.';
+      return null;
     }
     function ghTreeUrl(ref = 'HEAD') {
       return `https://api.github.com/repos/${cfg.repo}/git/trees/${encodeURIComponent(ref)}?recursive=1`;
@@ -7018,8 +7046,14 @@
 
       let filename = document.getElementById('stagingFilename').value.trim() || pendingUpload.defaultName;
       if (!filename.includes('.')) {
-        const ext = pendingUpload.blob.type.split('/')[1] || 'png';
-        filename += `.${ext}`;
+        const ext = (pendingUpload.blob.type.split('/')[1] || 'png').replace(/[^a-z0-9]/gi, '');
+        filename += `.${ext || 'png'}`;
+      }
+      const nameErr = fileNameError(filename);
+      if (nameErr) {
+        notify('error', nameErr);
+        document.getElementById('stagingFilename').focus();
+        return;
       }
 
       const targetFolder = getFolder(document.getElementById('stagingFolder').value);
@@ -7122,6 +7156,12 @@
       const newName = document.getElementById('renameInputNewName').value.trim();
       if (!newName || newName === ref.name) {
         document.getElementById('renameModal').classList.remove('open');
+        return;
+      }
+      const nameErr = fileNameError(newName);
+      if (nameErr) {
+        notify('error', nameErr);
+        document.getElementById('renameInputNewName').focus();
         return;
       }
 
@@ -7460,11 +7500,11 @@
 
       document.getElementById('plannerAvTitle').addEventListener('input', () => {
         ensureWeekData(planner.selectedKw).av.title = document.getElementById('plannerAvTitle').value;
-        savePlannerState();
+        savePlannerStateSoon();
       });
       document.getElementById('plannerAvNotes').addEventListener('input', () => {
         ensureWeekData(planner.selectedKw).av.notes = document.getElementById('plannerAvNotes').value;
-        savePlannerState();
+        savePlannerStateSoon();
       });
 
       // Quick-Add Action-Bar Pill Listeners
@@ -7608,7 +7648,7 @@
       const data = ensureWeekData(kw);
       if (!data.notes) data.notes = { mo: '', di: '', mi: '', do: '', fr: '' };
       data.notes[activeScratchpadDay] = val;
-      savePlannerState();
+      savePlannerStateSoon();
 
       const sTextEl = document.getElementById('scratchpadText');
       const mTextEl = document.getElementById('modalScratchpadText');
@@ -7691,7 +7731,9 @@
     }
     window.toggleFachberichtView = toggleFachberichtView;
 
-    function toggleDayLayout(forcedMode = null) {
+    // persist=false beim Anwenden aus renderPlanner(): frueher schrieb jedes
+    // Rendern die Einstellung erneut in den localStorage.
+    function toggleDayLayout(forcedMode = null, persist = true) {
       const grid = document.querySelector('.days-grid');
       const btn = document.getElementById('btnToggleDayLayout');
       if (!grid) return;
@@ -7701,7 +7743,7 @@
         btn.innerHTML = isCol ? '☷ Spalten-Raster' : '☰ Zeilen-Ansicht';
         btn.title = isCol ? 'Layout: Spalten-Raster aktiv (klicken für Zeilen-Ansicht)' : 'Layout: Zeilen-Ansicht aktiv (klicken für Spalten-Raster)';
       }
-      localStorage.setItem('cockpit_day_layout', isCol ? 'columns' : 'rows');
+      if (persist) { try { localStorage.setItem('cockpit_day_layout', isCol ? 'columns' : 'rows'); } catch(e) {} }
     }
     window.toggleDayLayout = toggleDayLayout;
 
@@ -7777,7 +7819,7 @@
       const old = data.notes[day];
       delete data.notes[day];
       savePlannerState();
-      renderPlanner();
+      renderPlannerDay(day);
       setScratchpadDay(day);
       pushUndo(`Tagesnotiz ${dayLabels[day]} entfernt`, () => {
         data.notes[day] = old;
@@ -8144,8 +8186,76 @@
     // Liest archivierte .md-Dateien (z. B. auf anderem Rechner erstellt oder
     // aus DEMO-Dateien) zurueck in den interaktiven Wochenplaner.
     // =========================================================================
+    // --- Markdown-Sicherheit ---------------------------------------------
+    // Nutzertext landet mitten in einer Datei, die der Parser zeilenweise
+    // wieder liest. Eine Fachbericht-Notiz mit "## Montag" oder "---" wurde
+    // frueher beim Rueck-Import als Tag bzw. Abschnittsende gelesen, ein
+    // Zeilenumbruch in einer Aufgabe zerriss die Aufzaehlung.
+    function mdInline(text) {
+      return String(text || '').replace(/\r?\n+/g, ' ').trim();
+    }
+    // Zeilen, die wie Struktur aussehen, mit '\' neutralisieren
+    // (Obsidian/GitHub zeigen sie dann als normalen Text).
+    const MD_STRUCT_LINE = /^(\s*)(#|>|\||-{3,}|\*{3,}|_{3,})/;
+    function mdBlock(text) {
+      return String(text || '').split(/\r?\n/)
+        .map(l => l.replace(MD_STRUCT_LINE, '$1\\$2'))
+        .join('\n');
+    }
+    function mdUnescapeLine(l) {
+      return l.replace(/^(\s*)\\(#|>|\||-{3,}|\*{3,}|_{3,})/, '$1$2');
+    }
+    function yamlStr(v) { return JSON.stringify(String(v === undefined || v === null ? '' : v)); }
+
+    // Fingerabdruck des sichtbaren Teils (ohne die updated:-Zeile, die sich
+    // bei jedem Schreiben aendert, und ohne Zeilenende-Unterschiede durch
+    // Git/OneDrive). Weicht er beim Einlesen ab, wurde die Datei ausserhalb
+    // des Cockpits bearbeitet (z. B. in Obsidian) - dann gilt der Text.
+    function mdBodyFingerprint(body) {
+      return hashStr(String(body || '').replace(/\r\n/g, '\n').replace(/^updated: .*$/m, '').trimEnd());
+    }
+
+    // Verlustfreier Zustand am Dateiende. Base64, weil JSON mit "-->" im Text
+    // den HTML-Kommentar vorzeitig beendet haette.
+    function readRawStateFromMarkdown(mdText) {
+      let m = /<!--\s*COCKPIT_RAW_STATE_B64:\s*([A-Za-z0-9+/=]+)\s*-->/.exec(mdText);
+      try {
+        if (m) return JSON.parse(decodeUtf8Base64(m[1]));
+        // Altes Format (Klartext-JSON) - bricht, falls ein Text "-->" enthielt.
+        m = /<!--\s*COCKPIT_RAW_STATE:\s*(\{[\s\S]*\})\s*-->\s*$/.exec(mdText.trim());
+        if (m) return JSON.parse(m[1]);
+      } catch(e) {
+        console.warn('[Markdown] RAW_STATE nicht lesbar, Text-Import:', e);
+      }
+      return null;
+    }
+
     function parseWeekMarkdown(mdText) {
       if (!mdText || typeof mdText !== 'string') return null;
+
+      // 1. Verlustfrei aus dem RAW_STATE (IDs, Uhrzeiten, Status, Presets).
+      //    Bereinigt wird beim Aufrufer (sanitizeWeek).
+      const raw = readRawStateFromMarkdown(mdText);
+      const rawIdx = mdText.search(/<!--\s*COCKPIT_RAW_STATE/);
+      const visibleBody = rawIdx >= 0 ? mdText.slice(0, rawIdx) : mdText;
+      const untouched = !!(raw && raw.bodyHash && mdBodyFingerprint(visibleBody) === raw.bodyHash);
+      if (raw && !untouched && raw.bodyHash) {
+        console.info('[Markdown] Datei wurde extern bearbeitet - Text statt RAW_STATE.');
+      }
+      if (untouched && raw.days && typeof raw.days === 'object') {
+        const fromRaw = {
+          days: raw.days,
+          dayTargets: raw.dayTargets || {},
+          dayPresets: raw.dayPresets || {},
+          notes: raw.notes || {},
+          av: raw.av || { title: '', notes: '' },
+          archived: true
+        };
+        if (raw.weekLog && typeof raw.weekLog === 'object') fromRaw.worktimeLog = raw.weekLog;
+        return fromRaw;
+      }
+
+      // 2. Rueckfall: Text-Parsing (verlustbehaftet, fuer fremde/alte Dateien)
 
       const weekData = {
         days: { mo: [], di: [], mi: [], do: [], fr: [] },
@@ -8300,7 +8410,7 @@
             inAv = false;
             continue;
           }
-          const trimmed = line.trim();
+          const trimmed = mdUnescapeLine(line.trim());
           if (trimmed && trimmed !== '*Keine Notizen erfasst.*') {
             weekData.av.notes = weekData.av.notes
               ? weekData.av.notes + '\n' + trimmed
@@ -8354,8 +8464,31 @@
         }
       }
 
+      // Reihenfolge: Steht die Woche im GitHub-Index und ist GitHub
+      // erreichbar, gilt GitHub - Platte und lokaler Server (Arbeitskopie,
+      // nur beim Start per git pull aktualisiert) koennen aelter sein.
+      // Offline oder ohne Token: erst Platte, dann lokaler Server.
+      const preferGithub = !!(cached && githubReady() && navigator.onLine !== false);
+
+      const tryGithub = async (path, name) => {
+        if (mdContent || !githubReady()) return;
+        try {
+          const gh = await fetchArchiveFile(path);
+          if (gh) { mdContent = gh.text; loadedSha = gh.sha; sourceName = name; }
+        } catch(e){}
+      };
+      const tryLocalServer = async (relPath, name) => {
+        if (mdContent || remoteOnly) return;
+        try {
+          const locRes = await fetch(`/${relPath}`, { cache: 'no-store' });
+          if (locRes.ok) { mdContent = await locRes.text(); sourceName = name; }
+        } catch(e){}
+      };
+
+      if (preferGithub) await tryGithub(cached.path, cached.filename);
+
       // 1. Lokaler OneDrive/Obsidian-Ordner (falls verknüpft, extrem schnell & offline)
-      if (!remoteOnly && typeof readMarkdownFromLocalDir === 'function') {
+      if (!mdContent && !remoteOnly && typeof readMarkdownFromLocalDir === 'function') {
         try {
           const localText = await readMarkdownFromLocalDir(kw, yr);
           if (localText) {
@@ -8367,28 +8500,8 @@
 
       // 2. Aus gecachter Dateiliste (aus Git-Tree-Scan)
       if (!mdContent && cached) {
-        // Lokaler Webserver (falls vorhanden)
-        if (!remoteOnly) {
-          try {
-            const locRes = await fetch(`/${BERICHTSHEFT_ROOT}/${cached.folder}/${cached.filename}`);
-            if (locRes.ok) {
-              mdContent = await locRes.text();
-              sourceName = cached.filename;
-            }
-          } catch(e){}
-        }
-
-        // Über GitHub API Contents (JSON, damit die sha zum Inhalt passt)
-        if (!mdContent && githubReady()) {
-          try {
-            const gh = await fetchArchiveFile(cached.path);
-            if (gh) {
-              mdContent = gh.text;
-              loadedSha = gh.sha;
-              sourceName = cached.filename;
-            }
-          } catch(e){}
-        }
+        await tryLocalServer(`${BERICHTSHEFT_ROOT}/${cached.folder}/${cached.filename}`, cached.filename);
+        await tryGithub(cached.path, cached.filename);
       }
 
       // 3. Fallback: Namenskandidaten durchprobieren
@@ -8400,28 +8513,9 @@
         ];
         for (const name of candidates) {
           const relPath = `${BERICHTSHEFT_ROOT}/${folder}/${name}`;
-          if (!remoteOnly) {
-            try {
-              const locRes = await fetch(`/${relPath}`);
-              if (locRes.ok) {
-                mdContent = await locRes.text();
-                sourceName = name;
-                break;
-              }
-            } catch(e){}
-          }
-
-          if (githubReady()) {
-            try {
-              const gh = await fetchArchiveFile(relPath);
-              if (gh) {
-                mdContent = gh.text;
-                loadedSha = gh.sha;
-                sourceName = name;
-                break;
-              }
-            } catch(e){}
-          }
+          await tryLocalServer(relPath, name);
+          await tryGithub(relPath, name);
+          if (mdContent) break;
         }
       }
 
@@ -8430,7 +8524,10 @@
         const parsed = rawParsed ? sanitizeWeek(rawParsed) : null;
         if (parsed && rawParsed.worktimeLog) parsed.worktimeLog = rawParsed.worktimeLog;
         if (parsed) {
-          parsed._sha = loadedSha || cached?.sha || null;
+          // Nur eine direkt von GitHub gelesene Fassung traegt deren sha. Eine
+          // lokale Kopie kann aelter sein - mit geerbter sha wuerde das
+          // Archivieren sie ohne Rueckfrage ueber die GitHub-Fassung schreiben.
+          parsed._sha = loadedSha || null;
           parsed._source = loadedSha ? 'github' : 'local';
           parsed._filename = sourceName;
           parsed._loadedAt = new Date().toISOString();
@@ -8520,15 +8617,15 @@
 
       // 1. YAML Frontmatter for Obsidian Properties
       let md = `---
-title: "Ausbildungsnachweis KW ${kw} (${yr})"
+title: ${yamlStr(`Ausbildungsnachweis KW ${kw} (${yr})`)}
 kw: ${kw}
 year: ${yr}
-startDate: "${startStr}"
-endDate: "${endStr}"
+startDate: ${yamlStr(startStr)}
+endDate: ${yamlStr(endStr)}
 totalHours: ${fmtH(totalIstHours)}
 targetHours: ${fmtH(totalTargetHours)}
-profession: "${activeProfession()}"
-company: "${cfg.betrieb || ''}"
+profession: ${yamlStr(activeProfession())}
+company: ${yamlStr(cfg.betrieb || '')}
 trainingYear: ${weekInfo.yearNumber || 1}
 status: ${data.archived ? 'archiviert' : 'entwurf'}
 updated: ${nowIso}
@@ -8575,7 +8672,7 @@ ${tagsList.join('\n')}
             else if (t.type === 'urlaub' || (activePreset === 'urlaub' && t.isPreset)) typeLabel = 'Urlaub';
             else if (t.type === 'feiertag' || (activePreset === 'feiertag' && t.isPreset)) typeLabel = 'Feiertag';
             else if (t.type === 'krank' || (activePreset === 'krank' && t.isPreset)) typeLabel = 'Krank';
-            md += `* **${fmtH(t.hours)}h** [${typeLabel}]: ${t.text}\n`;
+            md += `* **${fmtH(t.hours)}h** [${typeLabel}]: ${mdInline(t.text)}\n`;
           });
         }
 
@@ -8590,9 +8687,9 @@ ${tagsList.join('\n')}
       });
 
       // 3. Weekly Process (Wöchentlicher Arbeitsvorgang)
-      md += `---\n\n## 📝 Wöchentlicher Arbeitsvorgang\n**Thema:** ${data.av?.title || 'Keine Angabe'}\n\n`;
+      md += `---\n\n## 📝 Wöchentlicher Arbeitsvorgang\n**Thema:** ${mdInline(data.av?.title) || 'Keine Angabe'}\n\n`;
       if (data.av?.notes && data.av.notes.trim()) {
-        md += `${data.av.notes.trim()}\n\n`;
+        md += `${mdBlock(data.av.notes.trim())}\n\n`;
       } else {
         md += `*Keine Notizen erfasst.*\n\n`;
       }
@@ -8632,13 +8729,16 @@ ${tagsList.join('\n')}
       md += `| **Summe** | | | | **${fmtH(sumIstMin / 60)} h** | **${fmtH(sumSollMin / 60)} h** | **${totalDiffStr}** |\n\n`;
 
       // 5. Kopiervorlage fuers Berichtsheft
-      md += `---\n\n## 📋 Berichtsheft Ready-to-Paste\n\`\`\`text\n`;
+      const allTaskText = DAY_KEYS.map(d => (data.days[d] || []).map(t => t.text).join(' ')).join(' ');
+      const longestTicks = Math.max(0, ...(allTaskText.match(/`+/g) || []).map(x => x.length));
+      const fence = '`'.repeat(Math.max(3, longestTicks + 1));
+      md += `---\n\n## 📋 Berichtsheft Ready-to-Paste\n${fence}text\n`;
       md += `[BETRIEBLICHE TÄTIGKEITEN]\n`;
       ['mo', 'di', 'mi', 'do', 'fr'].forEach(d => {
         const ts = (data.days[d] || []).filter(t => t.type !== 'schule');
         if (ts.length > 0) {
           md += `${dayLabels[d]}:\n`;
-          ts.forEach(t => { md += `  - ${t.text} (${fmtH(t.hours)}h)\n`; });
+          ts.forEach(t => { md += `  - ${mdInline(t.text)} (${fmtH(t.hours)}h)\n`; });
         }
       });
 
@@ -8647,10 +8747,10 @@ ${tagsList.join('\n')}
         const ts = (data.days[d] || []).filter(t => t.type === 'schule');
         if (ts.length > 0) {
           md += `${dayLabels[d]}:\n`;
-          ts.forEach(t => { md += `  - ${t.text} (${fmtH(t.hours)}h)\n`; });
+          ts.forEach(t => { md += `  - ${mdInline(t.text)} (${fmtH(t.hours)}h)\n`; });
         }
       });
-      md += `\`\`\`\n\n`;
+      md += `${fence}\n\n`;
 
       // 6. Lossless State Rehydration Comment
       const rawState = {
@@ -8658,12 +8758,14 @@ ${tagsList.join('\n')}
         year: yr,
         days: data.days,
         dayTargets: data.dayTargets,
+        dayPresets: data.dayPresets,
         notes: data.notes,
         av: data.av,
         archived: data.archived || false,
         weekLog: DAY_KEYS.reduce((o, d) => { o[d] = peekWorkDayRow(d, kw, yr); return o; }, {})
       };
-      md += `<!-- COCKPIT_RAW_STATE: ${JSON.stringify(rawState)} -->\n`;
+      rawState.bodyHash = mdBodyFingerprint(md);
+      md += `<!-- COCKPIT_RAW_STATE_B64: ${encodeUtf8Base64(JSON.stringify(rawState))} -->\n`;
 
       return md;
     }
@@ -8921,6 +9023,11 @@ ${tagsList.join('\n')}
       } catch(e) {
         console.warn('[LocalFirst] LocalStorage write note:', e);
       }
+
+      // Undo-Closures zeigen auf die ersetzten Objekte - ein Rueckgaengig
+      // nach der Wiederherstellung wuerde ins Leere greifen.
+      undoStack = [];
+      if (typeof updateUndoUI === 'function') updateUndoUI();
 
       if (rerender) {
         try {
@@ -10019,6 +10126,7 @@ ${tagsList.join('\n')}
     }
 
     async function syncDraftToGithub(force = false) {
+      flushPendingPlannerSave();
       if (!githubReady()) {
         updateCloudSyncUI('no-token');
         if (force) {
@@ -10208,6 +10316,23 @@ ${tagsList.join('\n')}
       } catch(e) { /* offline - kein Hinweis noetig */ }
     }
 
+    // Fuer Tipp-Eingaben (Sammelnotiz, Fachbericht): der State im Speicher ist
+    // sofort aktuell, das Serialisieren des GESAMTEN Planers in den
+    // localStorage passiert aber erst nach einer kurzen Tipp-Pause statt bei
+    // jedem Tastendruck. flushPendingPlannerSave() holt es beim Verlassen
+    // der Seite und vor jedem Abgleich nach.
+    let plannerSaveTimer = null;
+    function savePlannerStateSoon(delayMs = 300) {
+      if (plannerSaveTimer) clearTimeout(plannerSaveTimer);
+      plannerSaveTimer = setTimeout(() => { plannerSaveTimer = null; savePlannerState(); }, delayMs);
+    }
+    function flushPendingPlannerSave() {
+      if (!plannerSaveTimer) return;
+      clearTimeout(plannerSaveTimer);
+      plannerSaveTimer = null;
+      savePlannerState();
+    }
+
     // 8. Save State Wrappers (Local-First: LocalStorage -> IndexedDB -> Festplatte)
     function savePlannerState() {
       localStorage.setItem(KEY_PLANNER, JSON.stringify(planner));
@@ -10275,6 +10400,7 @@ ${tagsList.join('\n')}
       if (isFlushingAll) return;
       isFlushingAll = true;
       try {
+        flushPendingPlannerSave();
         if (saveDebounceTimer) { clearTimeout(saveDebounceTimer); saveDebounceTimer = null; }
         flushLocalStorageSync();
 
@@ -10302,10 +10428,12 @@ ${tagsList.join('\n')}
     document.addEventListener('freeze', () => { flushAllNow('freeze'); });
 
     window.addEventListener('pagehide', () => {
+      flushPendingPlannerSave();
       flushLocalStorageSync();
     });
 
     window.addEventListener('beforeunload', (e) => {
+      flushPendingPlannerSave();
       flushLocalStorageSync();
       // Der einzige Mechanismus, der ein Schliessen ueberhaupt anhalten kann.
       // Bewusst eng begrenzt: nur bei offenen Aenderungen UND wenn keine
@@ -10321,6 +10449,8 @@ ${tagsList.join('\n')}
     let isScanningGithubWeeks = false;
     let lastGitTreeSha = null;
     let lastGitTreeEtag = null;
+    const SCAN_TTL_MS = 5 * 60 * 1000;
+    const TREE_INDEX_KEY = 'gh_tree_index';
 
     // Eine Archivdatei gehoert GENAU zu einer (Jahr, KW)-Kombination. Frueher
     // stand jede Datei zusaetzlich unter der nackten KW im Index; beim
@@ -10343,13 +10473,59 @@ ${tagsList.join('\n')}
       }
     }
 
+    // Eine Datei unter 01_Berichtsheft/... in den Index aufnehmen
+    function indexArchiveFile(set, map, path, sha, size) {
+      if (!path.startsWith(`${BERICHTSHEFT_ROOT}/`) || !path.endsWith('.md')) return;
+      const parts = path.split('/');
+      const filename = parts.pop();
+      const m = filename.match(/KW(\d+)(?:_(\d{4}))?/i);
+      if (!m) return;
+      const kwNum = parseInt(m[1], 10);
+      const folder = parts.length > 1 ? parts[1] : '';
+      // Jahr aus dem Dateinamen, sonst aus Ordner + Zeitraum
+      const yr = m[2] ? parseInt(m[2], 10) : yearForTrainingFolder(kwNum, folder);
+      if (!yr) return;
+      set.add(`${yr}_${kwNum}`);
+      setArchiveIndexEntry(map, `${yr}_${kwNum}`, {
+        folder: folder || getTrainingYearFolder(kwNum, yr), filename, path, sha, size: size || 0
+      }, kwNum, yr);
+    }
+
+    // Der Index ueberlebt den Neustart: mit gespeichertem ETag antwortet
+    // GitHub beim ersten Scan mit 304, und das zaehlt nicht gegen das Limit.
+    function saveTreeIndex() {
+      const entries = [...cachedArchivedFilesMap.entries()];
+      queueIdbWrite(async () => {
+        const db = await openSnapshotDb();
+        await idbPut(db, TREE_INDEX_KEY, { repo: cfg.repo, etag: lastGitTreeEtag, draftSha: remoteDraftTreeSha, entries, at: new Date().toISOString() });
+        db.close();
+      }).catch(() => {});
+    }
+
+    async function loadTreeIndex() {
+      try {
+        const db = await openSnapshotDb();
+        const idx = await idbGet(db, TREE_INDEX_KEY);
+        db.close();
+        if (!idx || idx.repo !== cfg.repo || !Array.isArray(idx.entries)) return;
+        cachedArchivedFilesMap = new Map(idx.entries);
+        cachedArchivedWeeks = new Set(idx.entries.map(e => e[0]));
+        lastGitTreeEtag = idx.etag || null;
+        remoteDraftTreeSha = idx.draftSha || null;
+      } catch(e) { /* ohne Index startet der Scan einfach frisch */ }
+    }
+
+    function archiveIndexSignature() {
+      return [...cachedArchivedFilesMap.entries()].map(([k, v]) => k + ':' + (v && v.sha)).sort().join('|');
+    }
+
     async function scanGithubWeeks(force = false) {
       if (!githubReady()) return;
       const now = Date.now();
-      // TTL-Cache: 5 Minuten, außer force = true
-      if (!force && (now - lastScanGithubWeeksTime < 5 * 60 * 1000) && cachedArchivedWeeks.size > 0) {
-        return;
-      }
+      // TTL gilt IMMER. Frueher nur bei nicht-leerem Index - ein Repo ohne
+      // archivierte Wochen loeste so bei jedem Radar-Render einen Tree- und
+      // drei Contents-Requests aus.
+      if (!force && (now - lastScanGithubWeeksTime < SCAN_TTL_MS)) return;
       if (isScanningGithubWeeks) return;
       isScanningGithubWeeks = true;
 
@@ -10358,113 +10534,71 @@ ${tagsList.join('\n')}
         const tempFilesMap = new Map();
         let treeLoaded = false;
 
-        // 1. Primär: Schneller Git Trees API Call (1 Request < 300 ms für das gesamte Repo)
         try {
-          const treeHeaders = {
-            'Authorization': `Bearer ${cfg.token}`,
-            'Accept': 'application/vnd.github+json'
-          };
-          if (!force && lastGitTreeEtag) {
-            treeHeaders['If-None-Match'] = lastGitTreeEtag;
-          }
+          const treeHeaders = ghHeaders();
+          // Auch bei force: 304 heisst "unveraendert" und kostet kein Limit.
+          if (lastGitTreeEtag) treeHeaders['If-None-Match'] = lastGitTreeEtag;
 
-          let treeRes = await fetch(ghTreeUrl('HEAD'), { headers: treeHeaders });
-          if (treeRes.status === 404) {
-            treeRes = await fetch(ghTreeUrl('main'), { headers: treeHeaders });
-          }
+          const treeRes = await fetch(ghTreeUrl('HEAD'), { headers: treeHeaders });
 
-          if (treeRes.status === 304 && cachedArchivedWeeks.size > 0) {
-            lastScanGithubWeeksTime = now;
+          if (treeRes.status === 304) {
+            treeLoaded = true;
+          } else if (treeRes.status === 409) {
+            // Leeres Repository: nichts archiviert, kein Ordner-Scan noetig
+            cachedArchivedWeeks = new Set();
+            cachedArchivedFilesMap = new Map();
+            lastGitTreeEtag = null;
+            treeLoaded = true;
+          } else if (treeRes.status === 401 || treeRes.status === 403 || treeRes.status === 404) {
+            // Kein Zugriff / Repo unbekannt: Folge-Requests wuerden genauso
+            // scheitern - bis zum naechsten TTL-Ablauf Ruhe geben.
             treeLoaded = true;
           } else if (treeRes.ok) {
-            const etag = treeRes.headers.get('etag');
-            if (etag) lastGitTreeEtag = etag;
-
             const treeData = await treeRes.json();
-            if (treeData && Array.isArray(treeData.tree)) {
+            if (treeData && Array.isArray(treeData.tree) && !treeData.truncated) {
               lastGitTreeSha = treeData.sha || null;
               treeData.tree.forEach(item => {
                 if (item.type !== 'blob') return;
-
                 // Cloud-Entwurf: sha NUR vormerken. cloudDraftSha bedeutet
                 // "diese Remote-Fassung steckt bereits im lokalen Stand" - die
                 // Tree-sha zu uebernehmen hiesse, eine nie gelesene Fassung
                 // beim naechsten PUT blind zu ueberschreiben.
-                if (item.path === DRAFT_FILE_PATH) {
-                  remoteDraftTreeSha = item.sha;
-                  return;
-                }
-
-                // Prüfen auf Berichtsheft-Wochen: 01_Berichtsheft/.../KW...md
-                if (item.path.startsWith(`${BERICHTSHEFT_ROOT}/`) && item.path.endsWith('.md')) {
-                  const m = item.path.match(/KW(\d+)(?:_(\d{4}))?/i);
-                  if (m) {
-                    const kwNum = parseInt(m[1], 10);
-                    const pathParts = item.path.split('/');
-                    const filename = pathParts.pop();
-                    const folder = pathParts.length > 1 ? pathParts[1] : '';
-
-                    // Jahr aus dem Dateinamen, sonst aus Ordner + Zeitraum
-                    const detectedYr = m[2] ? parseInt(m[2], 10) : yearForTrainingFolder(kwNum, folder);
-                    if (!detectedYr) return;
-
-                    tempSet.add(`${detectedYr}_${kwNum}`);
-                    const fileMeta = {
-                      folder: folder || getTrainingYearFolder(kwNum, detectedYr),
-                      filename,
-                      path: item.path,
-                      sha: item.sha,
-                      size: item.size || 0
-                    };
-                    setArchiveIndexEntry(tempFilesMap, `${detectedYr}_${kwNum}`, fileMeta, kwNum, detectedYr);
-                  }
-                }
+                if (item.path === DRAFT_FILE_PATH) { remoteDraftTreeSha = item.sha; return; }
+                indexArchiveFile(tempSet, tempFilesMap, item.path, item.sha, item.size);
               });
-
               cachedArchivedWeeks = tempSet;
               cachedArchivedFilesMap = tempFilesMap;
-              lastScanGithubWeeksTime = now;
+              lastGitTreeEtag = treeRes.headers.get('etag') || null;
               treeLoaded = true;
+              saveTreeIndex();
             }
+            // truncated (sehr grosses Repo): Ordner-Scan unten
           }
         } catch(treeErr) {
           console.warn('[Radar] Git Trees API note, fallback to folder scan:', treeErr);
+          // Netzwerkfehler: in 30 s erneut versuchen, nicht bei jedem Render
+          lastScanGithubWeeksTime = now - SCAN_TTL_MS + 30 * 1000;
+          return;
         }
 
-        // 2. Fallback: Traditioneller Folder-Scan via Contents API
+        // Fallback nur noch fuer abgeschnittene Trees
         if (!treeLoaded) {
           const lastInfo = getTrainingWeekInfo(getIsoWeekYear(trainingEndDate()).week, getIsoWeekYear(trainingEndDate()).year);
           const nYears = Math.max(3, lastInfo.yearNumber || 0);
           const folders = Array.from({ length: nYears }, (_, i) => `Ausbildungsjahr_${i + 1}`);
           await Promise.all(folders.map(async (folder) => {
             try {
-              const res = await fetch(`https://api.github.com/repos/${cfg.repo}/contents/${BERICHTSHEFT_ROOT}/${folder}`, {
-                headers: ghHeaders()
-              });
-              if (res.ok) {
-                const files = await res.json();
-                if (Array.isArray(files)) {
-                  files.forEach(f => {
-                    const m = f.name.match(/KW(\d+)(?:_(\d{4}))?/i);
-                    if (m) {
-                      const kwNum = parseInt(m[1], 10);
-                      const detectedYr = m[2] ? parseInt(m[2], 10) : yearForTrainingFolder(kwNum, folder);
-                      if (!detectedYr) return;
-                      tempSet.add(`${detectedYr}_${kwNum}`);
-                      setArchiveIndexEntry(tempFilesMap, `${detectedYr}_${kwNum}`,
-                        { folder, filename: f.name, path: f.path, sha: f.sha, size: f.size }, kwNum, detectedYr);
-                    }
-                  });
-                }
-              }
+              const res = await fetch(ghUrl(`${BERICHTSHEFT_ROOT}/${folder}`), { headers: ghHeaders() });
+              if (!res.ok) return;
+              const files = await res.json();
+              if (Array.isArray(files)) files.forEach(f => indexArchiveFile(tempSet, tempFilesMap, f.path, f.sha, f.size));
             } catch(e){}
           }));
-          if (tempSet.size > 0 || cachedArchivedWeeks.size === 0) {
-            cachedArchivedWeeks = tempSet;
-            cachedArchivedFilesMap = tempFilesMap;
-          }
-          lastScanGithubWeeksTime = now;
+          cachedArchivedWeeks = tempSet;
+          cachedArchivedFilesMap = tempFilesMap;
+          saveTreeIndex();
         }
+        lastScanGithubWeeksTime = now;
       } catch(e) {
         console.warn('[Radar] Scan error:', e);
       } finally {
@@ -10487,11 +10621,52 @@ ${tagsList.join('\n')}
       updateRadarYearPillsUI();
     }
 
+    // Sofort aus dem Cache zeichnen, im Hintergrund pruefen und NUR bei
+    // geaendertem Index erneut zeichnen. Frueher wartete jedes Rendern auf
+    // das Netz, bevor ueberhaupt etwas erschien.
     async function renderSidebarRadar() {
+      renderSidebarRadarNow();
+      if (!githubReady()) return;
+      const before = archiveIndexSignature();
       await scanGithubWeeks();
+      if (archiveIndexSignature() !== before) renderSidebarRadarNow();
+    }
+
+    // Ein Listener fuer alle Kacheln (statt 53 neuen Closures pro Render)
+    function bindRadarTileClicks(container) {
+      if (container.dataset.bound) return;
+      container.dataset.bound = '1';
+      container.addEventListener('click', async (e) => {
+        const tile = e.target.closest('.mini-week-tile[data-kw]');
+        if (!tile) return;
+        const kw = parseInt(tile.dataset.kw, 10);
+        const radarYear = parseInt(tile.dataset.yr, 10);
+        const sameWeek = (planner.selectedKw === kw && (planner.selectedYear || defaultPlannerYear()) === radarYear);
+        planner.selectedKw = kw;
+        planner.selectedYear = radarYear;
+        savePlannerState();
+
+        const curData = planner.weeks ? planner.weeks[getWeekStorageKey(kw, radarYear)] : null;
+        const isArchived = cachedArchivedWeeks.has(`${radarYear}_${kw}`) || (curData && curData.archived);
+        const needsContent = isArchived && (!curData || !Object.values(curData.days || {}).some(arr => arr.length > 0));
+
+        if (needsContent) {
+          renderPlanner({ loading: true });
+          renderSidebarRadarNow();
+          await tryLoadArchivedWeek(kw, radarYear, false);
+          renderPlanner({ loading: false });
+          renderSidebarRadarNow();
+        } else {
+          renderPlanner();
+          if (!sameWeek) renderSidebarRadarNow();
+        }
+      });
+    }
+
+    function renderSidebarRadarNow() {
       const container = document.getElementById('sidebarQuartersContainer');
       if (!container) return;
-      container.innerHTML = '';
+      bindRadarTileClicks(container);
 
       const radarYear = planner.selectedYear || defaultPlannerYear();
       const weeksInYear = weeksInIsoYear(radarYear);
@@ -10533,8 +10708,7 @@ ${tagsList.join('\n')}
 
       let cntArchived = 0;
       let cntMissing = 0;
-      let cntDraft = 0;
-      let cntTotal = 0;
+      const frag = document.createDocumentFragment();
 
       quarters.forEach(q => {
         const qSection = document.createElement('div');
@@ -10544,14 +10718,14 @@ ${tagsList.join('\n')}
         wrap.className = 'mini-weeks-grid';
 
         for (let kw = q.start; kw <= q.end; kw++) {
-          cntTotal++;
           const tile = document.createElement('div');
           tile.className = 'mini-week-tile';
           tile.textContent = kw;
+          tile.dataset.kw = kw;
+          tile.dataset.yr = radarYear;
 
           const dates = getKwDates(kw, radarYear);
           const weekInfo = getTrainingWeekInfo(kw, radarYear);
-          tile.title = `KW ${kw} (${dates.shortRange}${radarYear}) • ${weekInfo.detailedLabel}`;
 
           if (kw === planner.selectedKw && radarYear === (planner.selectedYear || defaultPlannerYear())) {
             tile.classList.add('selected');
@@ -10560,7 +10734,6 @@ ${tagsList.join('\n')}
           const weekData = getWeekData(kw, radarYear);
           const hasLocalDraft = weekData && (Object.values(weekData.days).some(arr => arr.length > 0) || !!weekData.av?.title || Object.values(weekData.notes || {}).some(n => n && n.trim()));
           const isArchived = cachedArchivedWeeks.has(`${radarYear}_${kw}`) || weekData?.archived;
-
           const isPastWeek = (radarYear < currentRealYear) || (radarYear === currentRealYear && kw < currentRealKw);
 
           if (isArchived) {
@@ -10571,7 +10744,6 @@ ${tagsList.join('\n')}
             tile.title = `KW ${kw} (${dates.shortRange}${radarYear}) • ${weekInfo.detailedLabel}`;
             if (hasLocalDraft) {
               tile.classList.add('draft');
-              cntDraft++;
             } else if (weekInfo.isPreStart || weekInfo.isPostEnd) {
               tile.classList.add('pre-start');
             } else if (isPastWeek) {
@@ -10579,35 +10751,16 @@ ${tagsList.join('\n')}
               cntMissing++;
             }
           }
-
-          tile.addEventListener('click', async () => {
-            const sameWeek = (planner.selectedKw === kw && (planner.selectedYear || defaultPlannerYear()) === radarYear);
-            planner.selectedKw = kw;
-            planner.selectedYear = radarYear;
-            savePlannerState();
-
-            const targetKey = getWeekStorageKey(kw, radarYear);
-            const curData = planner.weeks ? planner.weeks[targetKey] : null;
-            const needsContent = isArchived && (!curData || !Object.values(curData.days || {}).some(arr => arr.length > 0));
-
-            if (needsContent) {
-              renderPlanner({ loading: true });
-              renderSidebarRadar();
-              await tryLoadArchivedWeek(kw, radarYear, false);
-              renderPlanner({ loading: false });
-              renderSidebarRadar();
-            } else {
-              renderPlanner();
-              if (!sameWeek) renderSidebarRadar();
-            }
-          });
-
+          if (planner.conflicts && planner.conflicts[getWeekStorageKey(kw, radarYear)]) {
+            tile.title += ' • ⚠ Konflikt mit anderem Gerät';
+          }
           wrap.appendChild(tile);
         }
 
         qSection.appendChild(wrap);
-        container.appendChild(qSection);
+        frag.appendChild(qSection);
       });
+      container.replaceChildren(frag);
 
       const selDates = getKwDates(planner.selectedKw, planner.selectedYear || defaultPlannerYear());
       const selWeekInfo = getTrainingWeekInfo(planner.selectedKw, planner.selectedYear || defaultPlannerYear());
@@ -10707,7 +10860,7 @@ ${tagsList.join('\n')}
 
       data.days[day] = Array.from(map.values());
       savePlannerState();
-      renderPlanner();
+      renderPlannerDay(day);
       renderSidebarRadar();
       highlightDayColumn(day);
 
@@ -10793,7 +10946,7 @@ ${tagsList.join('\n')}
         : null;
 
       savePlannerState();
-      renderPlanner();
+      renderPlannerDay(day);
     }
     window.toggleTaskTransferred = toggleTaskTransferred;
 
@@ -10893,7 +11046,7 @@ ${tagsList.join('\n')}
       data.days[day] = [newTask];
 
       savePlannerState();
-      renderPlanner();
+      renderPlannerDay(day);
       renderSidebarRadar();
       highlightDayColumn(day, [newId]);
 
@@ -10922,7 +11075,7 @@ ${tagsList.join('\n')}
       data.days[day] = (data.days[day] || []).filter(t => !t.isPreset && t.text !== PRESET_CONFIG[prevPreset]?.defaultText);
 
       savePlannerState();
-      renderPlanner();
+      renderPlannerDay(day);
       renderSidebarRadar();
       highlightDayColumn(day);
 
@@ -10982,6 +11135,38 @@ ${tagsList.join('\n')}
     };
 
     let isPlannerLoading = false;
+
+    function renderWeekStatusBadge(data, kw, yr, isArchived) {
+      const sBadge = document.getElementById('plannerWeekStatusBadge');
+      if (isPlannerLoading || isLoadingArchivedWeek) {
+        sBadge.innerHTML = '<span class="spinner-sm" style="display:inline-block; vertical-align:middle; width:10px; height:10px; border-width:1.5px; margin-right:4px;"></span> Lade aus GitHub...';
+        sBadge.className = 'badge-pill info';
+        sBadge.title = 'Lade Berichtsheft-Inhalt aus dem GitHub-Repository...';
+      } else if (data.archived || isArchived) {
+        const fileInfo = cachedArchivedFilesMap.get(`${yr}_${kw}`);
+        const fileNameStr = fileInfo ? fileInfo.filename : (data._filename || `KW${String(kw).padStart(2,'0')}_${yr}.md`);
+        sBadge.textContent = '✓ Aus GitHub geladen';
+        sBadge.className = 'badge-pill success';
+        sBadge.title = `KW ${kw} (${yr}) ist permanent im GitHub-Repo archiviert (${fileNameStr})`;
+      } else {
+        const hasNotes = Object.values(data.days).some(arr => arr.length > 0) || !!data.av?.title || Object.values(data.notes || {}).some(n => n && n.trim().length > 0);
+        if (hasNotes) {
+          if (lastCloudSyncTime && !isDraftDirty()) {
+            sBadge.textContent = '☁️ Cloud-Entwurf aktiv';
+            sBadge.className = 'badge-pill info';
+            sBadge.title = 'Entwurf synchron mit GitHub (.draft_active.json)';
+          } else {
+            sBadge.textContent = '💾 Lokal gespeichert';
+            sBadge.className = 'badge-pill warning';
+            sBadge.title = 'Entwurf lokal im Browser gesichert (IndexedDB / LocalStorage)';
+          }
+        } else {
+          sBadge.textContent = '● Leer';
+          sBadge.className = 'badge-pill';
+          sBadge.title = 'Keine Aufgaben für diese Woche erfasst';
+        }
+      }
+    }
 
     function renderPlanner(opts) {
       if (opts && typeof opts.loading === 'boolean') {
@@ -11050,7 +11235,7 @@ ${tagsList.join('\n')}
 
       // Restore Day Layout Preference (Zeilen vs 5-Spalten-Raster)
       const savedLayout = localStorage.getItem('cockpit_day_layout') || 'rows';
-      toggleDayLayout(savedLayout);
+      toggleDayLayout(savedLayout, false);   // nur anwenden, nicht erneut speichern
 
       const daysContainer = document.getElementById('daysContainer');
       if (daysContainer) {
@@ -11063,35 +11248,7 @@ ${tagsList.join('\n')}
         }
       }
 
-      const sBadge = document.getElementById('plannerWeekStatusBadge');
-      if (isPlannerLoading || isLoadingArchivedWeek) {
-        sBadge.innerHTML = '<span class="spinner-sm" style="display:inline-block; vertical-align:middle; width:10px; height:10px; border-width:1.5px; margin-right:4px;"></span> Lade aus GitHub...';
-        sBadge.className = 'badge-pill info';
-        sBadge.title = 'Lade Berichtsheft-Inhalt aus dem GitHub-Repository...';
-      } else if (data.archived || isArchived) {
-        const fileInfo = cachedArchivedFilesMap.get(`${yr}_${kw}`);
-        const fileNameStr = fileInfo ? fileInfo.filename : (data._filename || `KW${String(kw).padStart(2,'0')}_${yr}.md`);
-        sBadge.textContent = '✓ Aus GitHub geladen';
-        sBadge.className = 'badge-pill success';
-        sBadge.title = `KW ${kw} (${yr}) ist permanent im GitHub-Repo archiviert (${fileNameStr})`;
-      } else {
-        const hasNotes = Object.values(data.days).some(arr => arr.length > 0) || !!data.av?.title || Object.values(data.notes || {}).some(n => n && n.trim().length > 0);
-        if (hasNotes) {
-          if (lastCloudSyncTime && !isDraftDirty()) {
-            sBadge.textContent = '☁️ Cloud-Entwurf aktiv';
-            sBadge.className = 'badge-pill info';
-            sBadge.title = 'Entwurf synchron mit GitHub (.draft_active.json)';
-          } else {
-            sBadge.textContent = '💾 Lokal gespeichert';
-            sBadge.className = 'badge-pill warning';
-            sBadge.title = 'Entwurf lokal im Browser gesichert (IndexedDB / LocalStorage)';
-          }
-        } else {
-          sBadge.textContent = '● Leer';
-          sBadge.className = 'badge-pill';
-          sBadge.title = 'Keine Aufgaben für diese Woche erfasst';
-        }
-      }
+      renderWeekStatusBadge(data, kw, yr, isArchived);
 
       const btnArchive = document.getElementById('btnSaveWeekToGithub');
       const btnArchiveLabel = document.getElementById('btnSaveWeekToGithubLabel');
@@ -11107,167 +11264,190 @@ ${tagsList.join('\n')}
         }
       }
 
-      const dayNames = { mo: 'Mo', di: 'Di', mi: 'Mi', do: 'Do', fr: 'Fr' };
       const holidays = getGermanHolidays(yr);
-
-      ['mo', 'di', 'mi', 'do', 'fr'].forEach(d => {
-        const list = document.getElementById(`tasks-${d}`);
-        const badge = document.getElementById(`badge-${d}`);
-        const nameEl = document.getElementById(`day-name-${d}`);
-        const cleanWrap = document.getElementById(`clean-wrap-${d}`);
-        const presetBar = document.getElementById(`preset-bar-${d}`);
-        const colEl = document.querySelector(`.day-column[data-day="${d}"]`);
-        const tasks = data.days[d] || [];
-        const target = data.dayTargets[d] || (d === 'fr' ? 6.0 : 7.75);
-        const activePreset = data.dayPresets ? data.dayPresets[d] : null;
-
-        // Apply visual styling to day column
-        if (colEl) {
-          colEl.classList.remove('preset-schule', 'preset-urlaub', 'preset-feiertag', 'preset-krank');
-          if (activePreset) {
-            colEl.classList.add(`preset-${activePreset}`);
-          }
-        }
-
-        // Automatic German Holiday Suggestion Pill
-        const dayDate = dates.days[d];
-        const holidayName = holidays[dayDate];
-        const holidayPill = (holidayName && !activePreset)
-          ? `<button type="button" class="holiday-suggestion-pill" onclick="applyDayPreset('${d}', 'feiertag')" title="Gesetzlicher Feiertag: ${holidayName}. Klicke für Preset.">🎉 ${holidayName}</button>`
-          : '';
-
-        // Render Day Preset Bar: aktives Preset bleibt sichtbar,
-        // alle weiteren Presets liegen in einem kompakten Hover-Menü.
-        if (presetBar) {
-          const presetChipHtml = (key) => {
-            const c = PRESET_CONFIG[key];
-            if (!c) return '';
-            return `<button type="button" class="day-preset-chip preset-${key} ${activePreset === key ? 'active' : ''}" onclick="applyDayPreset('${d}', '${key}')" title="${c.label} für ${dayLabels[d]} (${fmtH(target)}h)">${c.icon} ${c.label}</button>`;
-          };
-          presetBar.innerHTML = `
-            ${activePreset ? presetChipHtml(activePreset) : ''}
-            ${holidayPill}
-            <div class="day-preset-menu">
-              <button type="button" class="day-preset-menu-trigger" aria-haspopup="true" aria-expanded="false" onclick="toggleDayPresetMenu(event, this)" title="Tages-Presets für ${dayLabels[d]}">⋯</button>
-              <div class="day-preset-menu-pop" role="menu">
-                ${['schule', 'urlaub', 'feiertag', 'krank'].map(presetChipHtml).join('')}
-                ${activePreset ? `<button type="button" class="day-preset-chip" onclick="resetDayPreset('${d}')" title="Preset zurücksetzen">✕ Preset entfernen</button>` : ''}
-              </div>
-            </div>
-          `;
-        }
-
-        if (cleanWrap) {
-          cleanWrap.innerHTML = hasDayDuplicates(d) 
-            ? `<button class="day-clean-btn" onclick="deduplicateDay('${d}')" title="Duplikate in ${dayNames[d]} bereinigen">🧹 Duplikat</button>` 
-            : '';
-        }
-
-        if (nameEl) {
-          const hasDayNotes = !!(data.notes && data.notes[d] && data.notes[d].trim());
-          const lines = hasDayNotes ? data.notes[d].trim().split('\n').filter(l => l.trim().length > 0) : [];
-          const noteIndicator = lines.length > 0 
-            ? `<span title="Notiz vorhanden (${lines.length} Zeilen) – klicken zum Bearbeiten" style="cursor:pointer; font-size:0.75rem; margin-left:4px;" onclick="setScratchpadDay('${d}')">📝</span>` 
-            : '';
-          const presetCfg = activePreset ? PRESET_CONFIG[activePreset] : null;
-          const presetBadge = presetCfg ? `<span class="day-preset-active-indicator ${presetCfg.badgeClass}">${presetCfg.icon} ${presetCfg.label}</span>` : '';
-          const fullDayNames = { mo: 'Montag', di: 'Dienstag', mi: 'Mittwoch', do: 'Donnerstag', fr: 'Freitag' };
-          nameEl.innerHTML = `<span class="day-full-name">${fullDayNames[d]}</span> <span class="day-pipe">|</span> <span class="day-date-str">${dates.days[d]}</span>${presetBadge}${noteIndicator}`;
-        }
-
-        // Render Day Note Preview Box if notes exist for this day
-        let notePreviewEl = colEl ? colEl.querySelector('.day-note-preview-card') : null;
-        const dayNoteText = (data.notes && data.notes[d]) ? data.notes[d].trim() : '';
-        if (dayNoteText) {
-          if (!notePreviewEl) {
-            notePreviewEl = document.createElement('div');
-            notePreviewEl.className = 'day-note-preview-card';
-            if (colEl && list) {
-              colEl.insertBefore(notePreviewEl, list);
-            }
-          }
-          const noteLines = dayNoteText.split('\n').filter(l => l.trim().length > 0);
-          const firstLine = noteLines[0] || '';
-          notePreviewEl.onclick = () => setScratchpadDay(d);
-          notePreviewEl.title = `Tagesnotiz (${noteLines.length} Zeilen) – klicken zum Bearbeiten in der Sammelnotiz`;
-          notePreviewEl.innerHTML = `
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2px;">
-              <span style="font-size:0.68rem; font-weight:600; color:var(--accent); display:flex; align-items:center; gap:3px;">
-                📝 Notiz (${noteLines.length})
-              </span>
-              <button class="btn btn-ghost btn-sm" style="font-size:0.6rem; padding:0 3px; height:auto; color:var(--text-dim);" onclick="event.stopPropagation(); clearSingleDayNote('${d}')" title="Notiz entfernen">✕</button>
-            </div>
-            <div style="font-size:0.69rem; color:var(--text-secondary); line-height:1.25; max-height:36px; overflow:hidden; text-overflow:ellipsis; white-space:pre-line;">
-              ${escapeHtml(firstLine)}${noteLines.length > 1 ? ` (+${noteLines.length - 1})` : ''}
-            </div>
-          `;
-        } else if (notePreviewEl) {
-          notePreviewEl.remove();
-        }
-
-        let total = 0;
-        list.innerHTML = '';
-
-        if (tasks.length === 0) {
-          list.innerHTML = '';
-        } else {
-          tasks.forEach(t => {
-            total += t.hours;
-            const li = document.createElement('li');
-            li.className = 'task-item' + (t.transferred ? ' is-transferred' : '');
-            li.id = `task-item-${t.id}`;
-            
-            let typeCls = 'task-type-betrieb';
-            let typeTxt = 'B';
-            if (t.type === 'schule') {
-              typeCls = 'task-type-schule';
-              typeTxt = 'S';
-            } else if (t.type === 'urlaub' || (activePreset === 'urlaub' && t.isPreset)) {
-              typeCls = 'task-type-urlaub';
-              typeTxt = 'U';
-            } else if (t.type === 'feiertag' || (activePreset === 'feiertag' && t.isPreset)) {
-              typeCls = 'task-type-feiertag';
-              typeTxt = 'F';
-            } else if (t.type === 'krank' || (activePreset === 'krank' && t.isPreset)) {
-              typeCls = 'task-type-krank';
-              typeTxt = 'K';
-            }
-
-            const typeTitles = { B: 'Betriebliche Tätigkeit', S: 'Berufsschule', U: 'Urlaub', F: 'Feiertag', K: 'Krank' };
-            const timeBadge = t.timeStr ? `<span class="task-timestamp" title="Erfasst um ${escapeHtml(t.timeStr)} Uhr">${escapeHtml(t.timeStr)}</span>` : '';
-            const statusBtn = t.transferred
-              ? `<button type="button" class="task-status-btn transferred" onclick="toggleTaskTransferred('${d}', ${jsArg(t.id)})" title="Übertragen am ${escapeHtml(t.transferredAt || '')} – klicken zum Zurücksetzen" aria-label="Als offen markieren">✓</button>`
-              : `<button type="button" class="task-status-btn" onclick="toggleTaskTransferred('${d}', ${jsArg(t.id)})" title="Offen – klicken, wenn ans Berichtsheft übergeben" aria-label="Als übertragen markieren">○</button>`;
-
-            // Eine schlanke Zeile: Typ, Text, Zeit | Stunden, Status, Hover-Aktionen
-            li.innerHTML = `
-              <span class="task-main">
-                <span class="task-type-badge ${typeCls}" title="${typeTitles[typeTxt] || ''}">${typeTxt}</span>
-                <span class="task-text">${escapeHtml(t.text)}</span>
-                ${timeBadge}
-              </span>
-              <span class="task-meta">
-                <span class="task-hours">${fmtH(t.hours)} h</span>
-                ${statusBtn}
-                <span class="task-actions">
-                  <button type="button" class="task-icon-btn" onclick="editPlannerTask('${d}', ${jsArg(t.id)})" title="Aufgabe bearbeiten" aria-label="Aufgabe bearbeiten">✎</button>
-                  <button type="button" class="task-icon-btn danger" onclick="delPlannerTask('${d}', ${jsArg(t.id)})" title="Aufgabe löschen" aria-label="Aufgabe löschen">✕</button>
-                </span>
-              </span>
-            `;
-            list.appendChild(li);
-          });
-        }
-
-        badge.textContent = `${fmtH(total)} / ${fmtH(target)} h`;
-        badge.className = 'badge-pill';
-        if (Math.abs(total - target) < 0.05) badge.classList.add('success');
-        else if (total > 0) badge.classList.add('warning');
-      });
+      DAY_KEYS.forEach(d => renderDayColumn(d, data, dates, holidays));
 
       // Update scratchpad for currently selected week
       setScratchpadDay(activeScratchpadDay);
-      renderWorktimeTable();
+      // Die Arbeitszeit-Tabelle nur zeichnen, wenn Tab 3 sichtbar ist -
+      // switchTab('tab-worktime') rendert sie beim Oeffnen ohnehin.
+      if (isTabActive('tab-worktime')) renderWorktimeTable();
+    }
+
+    function isTabActive(tabId) {
+      const el = document.getElementById(tabId);
+      return !!(el && el.classList.contains('active'));
+    }
+
+    // Zeichnet NUR einen Tag neu (plus Wochenstatus). Fuer Aenderungen, die
+    // nur einen Tag betreffen - frueher baute jede Eingabe alle fuenf Tage,
+    // Kopfzeile, Fachbericht und die Arbeitszeit-Tabelle neu auf.
+    function renderPlannerDay(d) {
+      if (!DAY_KEYS.includes(d)) { renderPlanner(); return; }
+      const kw = planner.selectedKw;
+      const yr = planner.selectedYear || defaultPlannerYear();
+      const data = getWeekData(kw, yr);
+      const isArchived = cachedArchivedWeeks.has(`${yr}_${kw}`) || data.archived;
+      renderDayColumn(d, data, getKwDates(kw, yr), getGermanHolidays(yr));
+      renderWeekStatusBadge(data, kw, yr, isArchived);
+      if (d === activeScratchpadDay) updateScratchpadStats();
+    }
+    window.renderPlannerDay = renderPlannerDay;
+
+    function renderDayColumn(d, data, dates, holidays) {
+      const dayNames = { mo: 'Mo', di: 'Di', mi: 'Mi', do: 'Do', fr: 'Fr' };
+      const list = document.getElementById(`tasks-${d}`);
+      const badge = document.getElementById(`badge-${d}`);
+      const nameEl = document.getElementById(`day-name-${d}`);
+      const cleanWrap = document.getElementById(`clean-wrap-${d}`);
+      const presetBar = document.getElementById(`preset-bar-${d}`);
+      const colEl = document.querySelector(`.day-column[data-day="${d}"]`);
+      const tasks = data.days[d] || [];
+      const target = data.dayTargets[d] || (d === 'fr' ? 6.0 : 7.75);
+      const activePreset = data.dayPresets ? data.dayPresets[d] : null;
+
+      // Apply visual styling to day column
+      if (colEl) {
+        colEl.classList.remove('preset-schule', 'preset-urlaub', 'preset-feiertag', 'preset-krank');
+        if (activePreset) {
+          colEl.classList.add(`preset-${activePreset}`);
+        }
+      }
+
+      // Automatic German Holiday Suggestion Pill
+      const dayDate = dates.days[d];
+      const holidayName = holidays[dayDate];
+      const holidayPill = (holidayName && !activePreset)
+        ? `<button type="button" class="holiday-suggestion-pill" onclick="applyDayPreset('${d}', 'feiertag')" title="Gesetzlicher Feiertag: ${holidayName}. Klicke für Preset.">🎉 ${holidayName}</button>`
+        : '';
+
+      // Render Day Preset Bar: aktives Preset bleibt sichtbar,
+      // alle weiteren Presets liegen in einem kompakten Hover-Menü.
+      if (presetBar) {
+        const presetChipHtml = (key) => {
+          const c = PRESET_CONFIG[key];
+          if (!c) return '';
+          return `<button type="button" class="day-preset-chip preset-${key} ${activePreset === key ? 'active' : ''}" onclick="applyDayPreset('${d}', '${key}')" title="${c.label} für ${dayLabels[d]} (${fmtH(target)}h)">${c.icon} ${c.label}</button>`;
+        };
+        presetBar.innerHTML = `
+          ${activePreset ? presetChipHtml(activePreset) : ''}
+          ${holidayPill}
+          <div class="day-preset-menu">
+            <button type="button" class="day-preset-menu-trigger" aria-haspopup="true" aria-expanded="false" onclick="toggleDayPresetMenu(event, this)" title="Tages-Presets für ${dayLabels[d]}">⋯</button>
+            <div class="day-preset-menu-pop" role="menu">
+              ${['schule', 'urlaub', 'feiertag', 'krank'].map(presetChipHtml).join('')}
+              ${activePreset ? `<button type="button" class="day-preset-chip" onclick="resetDayPreset('${d}')" title="Preset zurücksetzen">✕ Preset entfernen</button>` : ''}
+            </div>
+          </div>
+        `;
+      }
+
+      if (cleanWrap) {
+        cleanWrap.innerHTML = hasDayDuplicates(d) 
+          ? `<button class="day-clean-btn" onclick="deduplicateDay('${d}')" title="Duplikate in ${dayNames[d]} bereinigen">🧹 Duplikat</button>` 
+          : '';
+      }
+
+      if (nameEl) {
+        const hasDayNotes = !!(data.notes && data.notes[d] && data.notes[d].trim());
+        const lines = hasDayNotes ? data.notes[d].trim().split('\n').filter(l => l.trim().length > 0) : [];
+        const noteIndicator = lines.length > 0 
+          ? `<span title="Notiz vorhanden (${lines.length} Zeilen) – klicken zum Bearbeiten" style="cursor:pointer; font-size:0.75rem; margin-left:4px;" onclick="setScratchpadDay('${d}')">📝</span>` 
+          : '';
+        const presetCfg = activePreset ? PRESET_CONFIG[activePreset] : null;
+        const presetBadge = presetCfg ? `<span class="day-preset-active-indicator ${presetCfg.badgeClass}">${presetCfg.icon} ${presetCfg.label}</span>` : '';
+        const fullDayNames = { mo: 'Montag', di: 'Dienstag', mi: 'Mittwoch', do: 'Donnerstag', fr: 'Freitag' };
+        nameEl.innerHTML = `<span class="day-full-name">${fullDayNames[d]}</span> <span class="day-pipe">|</span> <span class="day-date-str">${dates.days[d]}</span>${presetBadge}${noteIndicator}`;
+      }
+
+      // Render Day Note Preview Box if notes exist for this day
+      let notePreviewEl = colEl ? colEl.querySelector('.day-note-preview-card') : null;
+      const dayNoteText = (data.notes && data.notes[d]) ? data.notes[d].trim() : '';
+      if (dayNoteText) {
+        if (!notePreviewEl) {
+          notePreviewEl = document.createElement('div');
+          notePreviewEl.className = 'day-note-preview-card';
+          if (colEl && list) {
+            colEl.insertBefore(notePreviewEl, list);
+          }
+        }
+        const noteLines = dayNoteText.split('\n').filter(l => l.trim().length > 0);
+        const firstLine = noteLines[0] || '';
+        notePreviewEl.onclick = () => setScratchpadDay(d);
+        notePreviewEl.title = `Tagesnotiz (${noteLines.length} Zeilen) – klicken zum Bearbeiten in der Sammelnotiz`;
+        notePreviewEl.innerHTML = `
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2px;">
+            <span style="font-size:0.68rem; font-weight:600; color:var(--accent); display:flex; align-items:center; gap:3px;">
+              📝 Notiz (${noteLines.length})
+            </span>
+            <button class="btn btn-ghost btn-sm" style="font-size:0.6rem; padding:0 3px; height:auto; color:var(--text-dim);" onclick="event.stopPropagation(); clearSingleDayNote('${d}')" title="Notiz entfernen">✕</button>
+          </div>
+          <div style="font-size:0.69rem; color:var(--text-secondary); line-height:1.25; max-height:36px; overflow:hidden; text-overflow:ellipsis; white-space:pre-line;">
+            ${escapeHtml(firstLine)}${noteLines.length > 1 ? ` (+${noteLines.length - 1})` : ''}
+          </div>
+        `;
+      } else if (notePreviewEl) {
+        notePreviewEl.remove();
+      }
+
+      let total = 0;
+      list.innerHTML = '';
+
+      if (tasks.length === 0) {
+        list.innerHTML = '';
+      } else {
+        tasks.forEach(t => {
+          total += t.hours;
+          const li = document.createElement('li');
+          li.className = 'task-item' + (t.transferred ? ' is-transferred' : '');
+          li.id = `task-item-${t.id}`;
+          
+          let typeCls = 'task-type-betrieb';
+          let typeTxt = 'B';
+          if (t.type === 'schule') {
+            typeCls = 'task-type-schule';
+            typeTxt = 'S';
+          } else if (t.type === 'urlaub' || (activePreset === 'urlaub' && t.isPreset)) {
+            typeCls = 'task-type-urlaub';
+            typeTxt = 'U';
+          } else if (t.type === 'feiertag' || (activePreset === 'feiertag' && t.isPreset)) {
+            typeCls = 'task-type-feiertag';
+            typeTxt = 'F';
+          } else if (t.type === 'krank' || (activePreset === 'krank' && t.isPreset)) {
+            typeCls = 'task-type-krank';
+            typeTxt = 'K';
+          }
+
+          const typeTitles = { B: 'Betriebliche Tätigkeit', S: 'Berufsschule', U: 'Urlaub', F: 'Feiertag', K: 'Krank' };
+          const timeBadge = t.timeStr ? `<span class="task-timestamp" title="Erfasst um ${escapeHtml(t.timeStr)} Uhr">${escapeHtml(t.timeStr)}</span>` : '';
+          const statusBtn = t.transferred
+            ? `<button type="button" class="task-status-btn transferred" onclick="toggleTaskTransferred('${d}', ${jsArg(t.id)})" title="Übertragen am ${escapeHtml(t.transferredAt || '')} – klicken zum Zurücksetzen" aria-label="Als offen markieren">✓</button>`
+            : `<button type="button" class="task-status-btn" onclick="toggleTaskTransferred('${d}', ${jsArg(t.id)})" title="Offen – klicken, wenn ans Berichtsheft übergeben" aria-label="Als übertragen markieren">○</button>`;
+
+          // Eine schlanke Zeile: Typ, Text, Zeit | Stunden, Status, Hover-Aktionen
+          li.innerHTML = `
+            <span class="task-main">
+              <span class="task-type-badge ${typeCls}" title="${typeTitles[typeTxt] || ''}">${typeTxt}</span>
+              <span class="task-text">${escapeHtml(t.text)}</span>
+              ${timeBadge}
+            </span>
+            <span class="task-meta">
+              <span class="task-hours">${fmtH(t.hours)} h</span>
+              ${statusBtn}
+              <span class="task-actions">
+                <button type="button" class="task-icon-btn" onclick="editPlannerTask('${d}', ${jsArg(t.id)})" title="Aufgabe bearbeiten" aria-label="Aufgabe bearbeiten">✎</button>
+                <button type="button" class="task-icon-btn danger" onclick="delPlannerTask('${d}', ${jsArg(t.id)})" title="Aufgabe löschen" aria-label="Aufgabe löschen">✕</button>
+              </span>
+            </span>
+          `;
+          list.appendChild(li);
+        });
+      }
+
+      badge.textContent = `${fmtH(total)} / ${fmtH(target)} h`;
+      badge.className = 'badge-pill';
+      if (Math.abs(total - target) < 0.05) badge.classList.add('success');
+      else if (total > 0) badge.classList.add('warning');
     }
 
     window.quickAddForDay = function(d) {
@@ -11324,7 +11504,7 @@ ${tagsList.join('\n')}
       data.days[day].push({ id: newId, type, text, hours, timeStr, transferred: false });
       document.getElementById('plannerQcText').value = '';
       savePlannerState();
-      renderPlanner();
+      renderPlannerDay(day);
       renderSidebarRadar();
       // Kein Toast: die neue Zeile wird im Tag hervorgehoben.
       highlightDayColumn(day, [newId]);
@@ -11398,7 +11578,7 @@ ${tagsList.join('\n')}
       task.hours = Math.max(0.25, newHours);
 
       savePlannerState();
-      renderPlanner();
+      renderPlannerDay(d);
       renderSidebarRadar();
       pushUndo('Aufgabe bearbeitet', () => {
         task.text = prevText;
@@ -11423,7 +11603,7 @@ ${tagsList.join('\n')}
         if (data.dayPresets) data.dayPresets[d] = null;
       }
       savePlannerState();
-      renderPlanner();
+      renderPlannerDay(d);
       renderSidebarRadar();
 
       // Kein Popup-Banner mehr: der feste Undo-Button im Header wird aktiv.
@@ -12614,7 +12794,10 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
     window.toggleLf = function(id, key, val) {
       if (!ihkProgress[id]) ihkProgress[id] = { school: false, summary: false };
       ihkProgress[id][key] = val;
-      localStorage.setItem(KEY_IHK, JSON.stringify(ihkProgress));
+      try { localStorage.setItem(KEY_IHK, JSON.stringify(ihkProgress)); } catch(e) {}
+      // Frueher nur localStorage: der Haken fehlte bis zur naechsten anderen
+      // Aenderung in IndexedDB-Snapshot und Cloud-Entwurf.
+      schedulePersistence(900);
       renderIhk();
     };
 
@@ -12736,7 +12919,7 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
     function initPwaAndOffline() {
       // 1. Service Worker Registration (HTTP / HTTPS / Localhost)
       if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
-        window.addEventListener('load', () => {
+        const registerSw = () => {
           navigator.serviceWorker.register('./sw.js').then(reg => {
             console.log('[PWA] ServiceWorker registered with scope:', reg.scope);
             updatePwaBadge(true);
@@ -12744,7 +12927,12 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
             console.warn('[PWA] ServiceWorker registration warning:', err);
             updatePwaBadge(false);
           });
-        });
+        };
+        // initPwaAndOffline() laeuft erst nach mehreren awaits im Bootstrap -
+        // 'load' ist dann meist schon vorbei, und ein reiner load-Listener
+        // haette den Service Worker nie registriert.
+        if (document.readyState === 'complete') registerSw();
+        else window.addEventListener('load', registerSw, { once: true });
       } else if (location.protocol === 'file:') {
         // file:// protocol is 100% self-contained offline by design
         updatePwaBadge(true, 'file');
@@ -12872,6 +13060,7 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
       loadSettings();
       // Sync-Basis (zuletzt mit GitHub geteilte Fassung) vor jedem GitHub-Aufruf
       await loadSyncBase();
+      await loadTreeIndex();   // Archiv-Index + ETag vom letzten Lauf
       // Token-Hygiene: alte Snapshots bereinigen (einmalig), dann ggf. das
       // Token aus seinem eigenen IndexedDB-Eintrag zurueckholen.
       await stripTokensFromSnapshots();

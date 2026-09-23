@@ -14,7 +14,9 @@
 //   - übrige Assets  -> Stale-While-Revalidate (Icons, Manifest)
 // =========================================================================
 
-const CACHE_VERSION = 'v2';
+// v3: Archivdateien werden nicht mehr gecacht - alte Cache-Eintraege mit
+// veralteten KW-Dateien fallen beim Aktivieren weg.
+const CACHE_VERSION = 'v3';
 const CACHE_NAME = 'cockpit-cache-' + CACHE_VERSION;
 const CORE_ASSETS = [
   './',
@@ -63,6 +65,13 @@ self.addEventListener('fetch', (event) => {
 
   // Strikter Bypass für GitHub REST API und Nicht-GET Aufrufe
   if (req.method !== 'GET' || url.hostname.includes('api.github.com')) {
+    return;
+  }
+
+  // Archiv- und Nutzerdateien aus der Arbeitskopie: nie aus dem Cache.
+  // Stale-While-Revalidate lieferte sonst beim "Aus Archiv laden" zuerst
+  // eine alte Fassung einer Wochendatei aus.
+  if (url.origin === self.location.origin && /\/0[0-5]_[^/]+\//.test(url.pathname)) {
     return;
   }
 

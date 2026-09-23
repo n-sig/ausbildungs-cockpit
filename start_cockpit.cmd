@@ -28,34 +28,28 @@ echo   Ausbildungs-Cockpit wird gestartet ...
 echo.
 
 :: --- 0. Lokalen Stand mit GitHub synchronisieren (falls Git vorhanden) -----
+::  Nur bei sauberem Arbeitsbaum: mit lokalen Aenderungen wuerde ein Pull
+::  scheitern oder mischen - dann lieber gar nichts tun und Bescheid geben.
+::
+::  Frueher lud hier zusaetzlich ein PowerShell-Block dropzone.html ungeprueft
+::  von raw.githubusercontent.com und ersetzte die lokale Datei, sobald sich
+::  nur die Dateigroesse unterschied. Das war (a) eine Hintertuer: wer das
+::  Upstream-Repo kontrolliert, haette Code mit Zugriff auf jeden hinterlegten
+::  GitHub-Token verteilt, und (b) hat es lokale Aenderungen stillschweigend
+::  ueberschrieben. Updates laufen jetzt ausschliesslich ueber git.
 where git >nul 2>&1
 if %ERRORLEVEL% EQU 0 (
     if exist ".git" (
         set "GIT_TERMINAL_PROMPT=0"
-        git pull --quiet --ff-only >nul 2>&1
+        set "COCKPIT_DIRTY="
+        for /f "delims=" %%S in ('git status --porcelain 2^>nul') do set "COCKPIT_DIRTY=1"
+        if defined COCKPIT_DIRTY (
+            echo   [HINWEIS] Lokale Aenderungen vorhanden - kein automatisches Update.
+        ) else (
+            git pull --quiet --ff-only >nul 2>&1
+        )
     )
 )
-
-:: --- 0b. Cockpit im Hintergrund auf Updates pruefen ------------------------
-powershell -NoProfile -Command ^
-  "$u='https://raw.githubusercontent.com/n-sig/ausbildungs-cockpit/main/dropzone.html';" ^
-  "try {" ^
-  "  $req = [System.Net.HttpWebRequest]::Create($u);" ^
-  "  $req.Method = 'HEAD'; $req.Timeout = 1500;" ^
-  "  $res = $req.GetResponse();" ^
-  "  $remoteLen = $res.ContentLength; $res.Close();" ^
-  "  $localFile = Resolve-Path 'dropzone.html' -ErrorAction SilentlyContinue;" ^
-  "  if ($localFile -and $remoteLen -gt 10000) {" ^
-  "    $localLen = (Get-Item $localFile).Length;" ^
-  "    if ($localLen -ne $remoteLen) {" ^
-  "      Invoke-WebRequest $u -OutFile ($localFile.Path + '.new') -TimeoutSec 5 -UseBasicParsing;" ^
-  "      if ((Test-Path ($localFile.Path + '.new')) -and (Get-Item ($localFile.Path + '.new')).Length -gt 10000) {" ^
-  "        Move-Item ($localFile.Path + '.new') $localFile.Path -Force;" ^
-  "        Write-Output '  [UPDATE] dropzone.html wurde auf die neueste Version aktualisiert.';" ^
-  "      }" ^
-  "    }" ^
-  "  }" ^
-  "} catch {}"
 
 :: --- 1. Laeuft BEREITS UNSER Server? -------------------------------------
 ::  Nicht nur "ist der Port belegt?" pruefen: haelt ihn ein fremder Prozess,
