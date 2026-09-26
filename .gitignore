@@ -20,14 +20,6 @@ Desktop.ini
 credentials.json
 secrets.txt
 
-# Lokale Einstellungen von Editoren und KI-Werkzeugen
-.vscode/
-.idea/
-.claude/
-.cursor/
-CLAUDE.md
-AGENTS.md
-
 # Abhängigkeiten eigener Werkzeuge
 node_modules/
 __pycache__/
