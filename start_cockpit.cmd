@@ -95,10 +95,14 @@ if %ERRORLEVEL% EQU 0 (
 )
 
 :: --- 3. Python-Server im Hintergrund starten ------------------------------
-where python >nul 2>&1
+::  "python --version" statt "where python": Windows liefert ohne installiertes
+::  Python einen Platzhalter aus dem Microsoft Store mit, den "where" findet,
+::  der aber nichts startet.
+python --version >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
-    echo   [FEHLER] python wurde nicht gefunden ^(PATH^).
-    echo   Bitte Python installieren oder den PATH ergaenzen.
+    echo   [FEHLER] Python wurde nicht gefunden.
+    echo   Python von python.org installieren und dabei
+    echo   "Add python.exe to PATH" anhaken.
     pause
     exit /b 1
 )
