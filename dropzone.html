@@ -4202,7 +4202,7 @@
           <div class="settings-field">
             <label class="settings-label" for="cfgToken">
               Personal Access Token
-              <span class="help-icon" tabindex="0" role="button" aria-label="Hilfe anzeigen">?<span class="tooltip-box">Personal Access Token mit <code>repo</code>-Scope. Wird ausschließlich lokal im Browser gespeichert und nur für Bildertransfer und Wochenarchivierung verwendet.</span></span>
+              <span class="help-icon" tabindex="0" role="button" aria-label="Hilfe anzeigen">?<span class="tooltip-box">Fine-grained Token nur für dein Repository, mit der Berechtigung <code>Contents: Read and write</code>. Bleibt im Browser dieses Geräts und wird nur an GitHub gesendet – für Dateien, Wochenarchiv und Entwurf-Abgleich.</span></span>
             </label>
             <div style="display: flex; gap: 4px; min-width: 0;">
               <input type="password" id="cfgToken" style="flex: 1; min-width: 0;" placeholder="github_pat_...">
@@ -4362,7 +4362,7 @@
           <div class="settings-section-head">
             <span class="settings-head-left">
               Reiter in Tab 1
-              <span class="help-icon" tabindex="0" role="button" aria-label="Hilfe anzeigen">?<span class="tooltip-box">Jeder Reiter zeigt auf einen Ordner im Repository. <strong>Den Pfad zu ändern verschiebt keine Dateien</strong> – der Reiter zeigt danach nur woanders hin. Das Berichtsheft-Archiv ist fest verdrahtet, weil daran die Wochen-Erkennung hängt, und steht deshalb nicht in dieser Liste.</span></span>
+              <span class="help-icon" tabindex="0" role="button" aria-label="Hilfe anzeigen">?<span class="tooltip-box">Jeder Reiter zeigt auf einen Ordner im Repository. <strong>Den Pfad zu ändern verschiebt keine Dateien</strong> – der Reiter zeigt danach nur woanders hin. Wo das Berichtsheft-Archiv liegt (<code>01_Berichtsheft</code>), ist fest vorgegeben, weil daran die Wochen-Erkennung hängt. Den Reiter „Berichtsheft“ zu ändern oder zu entfernen, ändert daran nichts.</span></span>
             </span>
             <span id="folderCountBadge" class="badge-pill">0 Reiter</span>
           </div>
@@ -6840,7 +6840,7 @@
       if (folder.backend === 'github') {
         if (cfg.githubImageTransfer === false) {
           allCurrentFiles = [];
-          expList.innerHTML = explorerStatusHtml('var(--text-muted)', 'GitHub Bilder-Transfer ist deaktiviert. (Einstellungen → Sicherungs- &amp; Sync-Steuerung)');
+          expList.innerHTML = explorerStatusHtml('var(--text-muted)', 'Bilder-Transfer ist ausgeschaltet. (⚙️ Einstellungen → GitHub → Bilder-Transfer)');
           return;
         }
         if (!cfg.repo) {
