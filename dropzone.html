@@ -1540,6 +1540,11 @@
     #folderFormError { flex: 0 0 auto; }
     #folderFormError[hidden] { display: none; }
 
+    /* App-Update: gleiche Loesung fuer die ein- und ausgeblendeten Teile. */
+    #updateStatus { flex: 0 0 auto; }
+    #updateBackupRow { display: flex; align-items: center; gap: 0.4rem; font-size: 0.75rem; color: var(--text-secondary); cursor: pointer; }
+    #updateBackupRow[hidden], #updateNotes[hidden], #btnRunUpdate[hidden] { display: none; }
+
     .file-row {
       display: flex;
       justify-content: space-between;
@@ -3297,6 +3302,10 @@
           <svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" fill="none" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
           <span class="btn-label">App installieren</span>
         </button>
+        <button id="btnHeaderUpdate" class="btn btn-sm" type="button" style="display: none; border-color: var(--accent-border); color: var(--accent);" title="Eine neue Version des Cockpits ist verfügbar">
+          <svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" fill="none" stroke-width="2"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg>
+          <span class="btn-label" id="btnHeaderUpdateLabel">Update</span>
+        </button>
         <button id="btnOpenQuickNote" class="btn btn-sm btn-accent" title="Vortrags-Schnellnotiz (Taste N)">
           <svg viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>
           <span class="btn-label">Notizen</span> <kbd class="btn-kbd">N</kbd>
@@ -4254,6 +4263,25 @@
               <svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" fill="none" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
               Entwurf jetzt pushen
             </button>
+          </div>
+
+          <!-- data-settings-skip: Die Update-Steuerung ist keine Einstellung;
+               ihr Haekchen darf commitSettings() nicht ausloesen. -->
+          <div id="updateSection" class="settings-divider" data-settings-skip>
+            <div class="settings-label">
+              App-Update
+              <span class="help-icon" tabindex="0" role="button" aria-label="Hilfe anzeigen">?<span class="tooltip-box">Holt eine neue Version aus der Vorlage <code>n-sig/ausbildungs-cockpit</code> und schreibt sie als einen Commit in deine Kopie. Ersetzt werden nur die Dateien im Hauptordner (App, Starter, Anleitung). Deine Ordner, Dateien und Planer-Daten bleiben unberührt.</span></span>
+            </div>
+            <div id="updateStatus" class="settings-path" style="height: auto; padding: 0.4rem 0.6rem; white-space: normal;"></div>
+            <pre id="updateNotes" hidden style="margin: 0; max-height: 160px; overflow: auto; white-space: pre-wrap; font-family: var(--font-mono); font-size: 0.7rem; padding: 0.5rem 0.6rem; background: var(--bg-subtle); border: 1px solid var(--border-card); border-radius: var(--radius-md); color: var(--text-secondary);"></pre>
+            <label id="updateBackupRow" hidden>
+              <input type="checkbox" id="updateBackupFirst" checked>
+              Vorher eine Sicherung herunterladen (empfohlen)
+            </label>
+            <div class="settings-btn-row">
+              <button type="button" id="btnCheckUpdate" class="btn btn-sm">Nach Updates suchen</button>
+              <button type="button" id="btnRunUpdate" class="btn btn-primary btn-sm" hidden>Jetzt aktualisieren</button>
+            </div>
           </div>
         </div>
 
@@ -6703,6 +6731,277 @@
       e.status = res.status;
       return e;
     }
+
+    // =========================================================================
+    // APP-UPDATE AUS DER VORLAGE
+    // Holt eine veroeffentlichte Version aus dem Template und schreibt sie als
+    // EINEN Commit in die eigene Kopie. Ersetzt werden nur Dateien im
+    // Hauptordner der Vorlage (App, Starter, Anleitung). Unterordner - und
+    // damit alle Inhalte in 01_ bis 05_ - werden nie angefasst; Dateien, die
+    // es nur in der eigenen Kopie gibt, bleiben stehen.
+    //
+    // Sicherheit: Die Quelle ist fest verdrahtet und nicht einstellbar, es
+    // gibt nur veroeffentlichte Releases, und nichts passiert ohne Klick. Die
+    // Anfragen an die Vorlage laufen OHNE Token - der gilt nur fuer die eigene
+    // Kopie und hat bei der Vorlage nichts verloren.
+    //
+    // Auf die Platte kommt das Update erst beim naechsten Start:
+    // start_cockpit.cmd holt es per git pull wie jede andere Aenderung aus der
+    // Kopie - auf diesem und auf allen anderen Geraeten.
+    // =========================================================================
+    const APP_VERSION = '1.2.0';
+    const UPDATE_SOURCE_REPO = 'n-sig/ausbildungs-cockpit';
+    const UPDATE_CHECK_KEY = 'cockpit_update_check_v1';
+    const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+    const UPDATE_GH_API = 'https://api.github.com';
+    let latestRelease = null;   // { tag, version, notes } aus der letzten Pruefung
+    let updateRunning = false;
+
+    function parseAppVersion(v) {
+      const m = String(v || '').trim().match(/^v?(\d{1,4})\.(\d{1,4})\.(\d{1,4})$/);
+      return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+    }
+    function isNewerAppVersion(candidate, current) {
+      const a = parseAppVersion(candidate);
+      const b = parseAppVersion(current);
+      if (!a || !b) return false;
+      for (let i = 0; i < 3; i++) { if (a[i] !== b[i]) return a[i] > b[i]; }
+      return false;
+    }
+    function updateAvailable() {
+      return !!(latestRelease && isNewerAppVersion(latestRelease.version, APP_VERSION));
+    }
+    function isUpdateSourceRepo() {
+      return String(cfg.repo || '').toLowerCase() === UPDATE_SOURCE_REPO.toLowerCase();
+    }
+
+    // Fehler mit Herkunft: 404 bei der Vorlage heisst etwas anderes als 404
+    // bei der eigenen Kopie (dort meist: Token ohne Zugriff).
+    function updateFail(res, source) {
+      const e = ghFail(res);
+      e.source = source;
+      e.rateLimited = (res.status === 403 || res.status === 429) && res.headers.get('x-ratelimit-remaining') === '0';
+      return e;
+    }
+    function updateErrorText(e) {
+      if (e && e.rateLimited) return 'GitHub begrenzt gerade die Anfragen. Versuch es in einer Stunde noch einmal.';
+      if (e && e.source === 'vorlage' && e.status === 404) return 'Die Vorlage ist nicht erreichbar oder hat noch keine Veröffentlichung.';
+      if (e && e.source === 'kopie' && (e.status === 401 || e.status === 403)) return 'Dein Token darf nicht in deine Kopie schreiben. Er braucht „Contents: Read and write“.';
+      if (e && e.source === 'kopie' && e.status === 404) return 'Deine Kopie wurde nicht gefunden. Prüfe Repository und Token.';
+      if (e instanceof TypeError) return 'Keine Verbindung zu GitHub.';
+      return (e && e.message) || 'Unbekannter Fehler.';
+    }
+
+    async function updateSourceJson(path) {
+      const res = await fetch(`${UPDATE_GH_API}/repos/${UPDATE_SOURCE_REPO}/${path}`, {
+        headers: { 'Accept': 'application/vnd.github+json' }, cache: 'no-store'
+      });
+      if (!res.ok) throw updateFail(res, 'vorlage');
+      return res.json();
+    }
+    async function ownRepoJson(path, method, body) {
+      const opts = { method: method || 'GET', cache: 'no-store', headers: body ? ghJsonHeaders() : ghHeaders() };
+      if (body) opts.body = JSON.stringify(body);
+      const res = await fetch(`${UPDATE_GH_API}/repos/${cfg.repo}${path ? '/' + path : ''}`, opts);
+      if (!res.ok) throw updateFail(res, 'kopie');
+      return res.json();
+    }
+
+    // Die Release-Notes sind fremder Text: nur als textContent verwenden.
+    async function fetchLatestRelease() {
+      const r = await updateSourceJson('releases/latest');
+      const tag = String(r.tag_name || '');
+      if (!parseAppVersion(tag)) throw new Error('Unbekanntes Versionsformat in der Vorlage: ' + tag.slice(0, 40));
+      return { tag, version: tag.replace(/^v/, ''), notes: String(r.body || '').slice(0, 6000) };
+    }
+
+    function readUpdateCheck() {
+      try {
+        const o = JSON.parse(localStorage.getItem(UPDATE_CHECK_KEY) || 'null');
+        return (o && typeof o === 'object') ? o : null;
+      } catch(e) { return null; }
+    }
+    function writeUpdateCheck(o) {
+      try { localStorage.setItem(UPDATE_CHECK_KEY, JSON.stringify(o)); } catch(e) {}
+    }
+
+    // state: idle | checking | current | available | running | done | error
+    function renderUpdateUI(state, detail) {
+      const status = document.getElementById('updateStatus');
+      const notes = document.getElementById('updateNotes');
+      const backupRow = document.getElementById('updateBackupRow');
+      const btnRun = document.getElementById('btnRunUpdate');
+      const btnCheck = document.getElementById('btnCheckUpdate');
+      const header = document.getElementById('btnHeaderUpdate');
+      const headerLabel = document.getElementById('btnHeaderUpdateLabel');
+      if (!status) return;
+
+      const avail = updateAvailable();
+      if (state === 'idle' && avail) state = 'available';
+      // Nach einem Fehler direkt erneut anbieten - die Kopie ist dann unveraendert.
+      const offerRun = (state === 'available' || (state === 'error' && avail)) && !isUpdateSourceRepo();
+
+      let text;
+      if (state === 'checking') text = 'Suche nach Updates …';
+      else if (state === 'current') text = `Version ${APP_VERSION} ist aktuell.`;
+      else if (state === 'available') {
+        text = `Version ${latestRelease.version} ist verfügbar (installiert: ${APP_VERSION}).`;
+        if (isUpdateSourceRepo()) text += ' Das hier ist die Vorlage selbst – hier gibt es kein Update.';
+        else if (!githubReady()) text += ' Für das Update brauchst du oben Token und Repository.';
+      }
+      else if (state === 'running') text = detail || 'Update läuft …';
+      else if (state === 'done') text = detail;
+      else if (state === 'error') text = detail || 'Unbekannter Fehler.';
+      else text = `Installiert: Version ${APP_VERSION}.`;
+      status.textContent = text;
+      status.style.color = state === 'error' ? 'var(--status-red-text)'
+        : (state === 'done' || state === 'available') ? 'var(--status-green-text)' : '';
+
+      const showNotes = (state === 'available' || state === 'running') && latestRelease && latestRelease.notes;
+      notes.hidden = !showNotes;
+      notes.textContent = showNotes ? latestRelease.notes : '';
+      backupRow.hidden = !offerRun;
+      btnRun.hidden = !offerRun;
+      btnRun.disabled = state === 'running';
+      btnCheck.disabled = state === 'running' || state === 'checking';
+
+      const showHeader = avail && state !== 'done' && !isUpdateSourceRepo();
+      header.style.display = showHeader ? 'inline-flex' : 'none';
+      if (showHeader) headerLabel.textContent = `Update ${latestRelease.version}`;
+    }
+
+    async function checkForUpdate(manual) {
+      if (manual) renderUpdateUI('checking');
+      try {
+        latestRelease = await fetchLatestRelease();
+        writeUpdateCheck({ at: Date.now(), tag: latestRelease.tag, notes: latestRelease.notes });
+        renderUpdateUI(updateAvailable() ? 'available' : 'current');
+      } catch(e) {
+        // Auch einen Fehlversuch merken: sonst fragt jeder Start erneut
+        // (Rate-Limit bei vielen Geraeten hinter einer Firmen-IP).
+        const last = readUpdateCheck() || {};
+        writeUpdateCheck(Object.assign({}, last, { at: Date.now() }));
+        if (manual) renderUpdateUI('error', 'Update-Prüfung fehlgeschlagen: ' + updateErrorText(e));
+        else console.info('[Update] Pruefung uebersprungen:', e && e.message);
+      }
+    }
+
+    // Beim Start: Ergebnis der letzten Pruefung anzeigen, hoechstens einmal
+    // am Tag leise neu nachsehen.
+    function scheduleQuietUpdateCheck() {
+      const last = readUpdateCheck();
+      if (last && parseAppVersion(last.tag)) {
+        latestRelease = {
+          tag: String(last.tag),
+          version: String(last.tag).replace(/^v/, ''),
+          notes: typeof last.notes === 'string' ? last.notes.slice(0, 6000) : ''
+        };
+      }
+      renderUpdateUI('idle');
+      const age = last ? Date.now() - Number(last.at) : NaN;
+      const due = !(age >= 0 && age < UPDATE_CHECK_INTERVAL_MS);
+      if (!due || !navigator.onLine || location.protocol === 'file:') return;
+      setTimeout(() => checkForUpdate(false), 4000);
+    }
+
+    // Alle Dateien im Hauptordner der Vorlage bei genau diesem Release-Tag.
+    async function fetchTemplateRootFiles(tag) {
+      const tree = await updateSourceJson(`git/trees/${encodeURIComponent(tag)}`);
+      const blobs = (tree.tree || []).filter(e => e && e.type === 'blob' && e.mode !== '120000'
+        && typeof e.path === 'string' && e.path && !e.path.includes('/') && /^[0-9a-f]{40}$/.test(e.sha));
+      if (!blobs.some(b => b.path === 'dropzone.html')) throw new Error('Die Vorlage enthält keine dropzone.html – Update abgebrochen.');
+      const files = [];
+      for (const b of blobs) {
+        const blob = await updateSourceJson(`git/blobs/${b.sha}`);
+        if (blob.encoding !== 'base64' || typeof blob.content !== 'string') throw new Error('Unerwartetes Format bei ' + b.path);
+        files.push({ path: b.path, mode: b.mode === '100755' ? '100755' : '100644', content: blob.content.replace(/\s/g, '') });
+      }
+      return files;
+    }
+
+    // Ein Commit auf dem Standard-Branch der eigenen Kopie. base_tree sorgt
+    // dafuer, dass alles, was nicht in files steht, unveraendert bleibt.
+    async function commitFilesToOwnRepo(files, message) {
+      const repo = await ownRepoJson('');
+      const branch = ghPath(String(repo.default_branch || 'main'));
+      const entries = [];
+      for (const f of files) {
+        const b = await ownRepoJson('git/blobs', 'POST', { content: f.content, encoding: 'base64' });
+        entries.push({ path: f.path, mode: f.mode, type: 'blob', sha: b.sha });
+      }
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const ref = await ownRepoJson(`git/ref/heads/${branch}`);
+        const headSha = ref && ref.object && ref.object.sha;
+        const head = await ownRepoJson(`git/commits/${headSha}`);
+        const tree = await ownRepoJson('git/trees', 'POST', { base_tree: head.tree.sha, tree: entries });
+        if (tree.sha === head.tree.sha) return { unchanged: true };
+        const commit = await ownRepoJson('git/commits', 'POST', { message, tree: tree.sha, parents: [headSha] });
+        try {
+          await ownRepoJson(`git/refs/heads/${branch}`, 'PATCH', { sha: commit.sha, force: false });
+          return { unchanged: false, sha: commit.sha };
+        } catch(e) {
+          // Inzwischen hat jemand anderes gepusht: einmal neu aufsetzen.
+          if (e.status === 422 && attempt === 0) continue;
+          throw e;
+        }
+      }
+      throw new Error('Deine Kopie hat sich während des Updates verändert. Bitte noch einmal versuchen.');
+    }
+
+    function savePreUpdateSnapshot(tag) {
+      const before = JSON.parse(JSON.stringify(buildStateSnapshot()));
+      return queueIdbWrite(async () => {
+        const db = await openSnapshotDb();
+        await idbPut(db, 'pre_update_' + tag + '_' + Date.now(), before);
+        db.close();
+      }).catch(e => console.warn('[Update] Sicherung vor dem Update fehlgeschlagen:', e));
+    }
+
+    async function runAppUpdate() {
+      if (updateRunning || !updateAvailable() || isUpdateSourceRepo()) return;
+      if (!githubReady()) {
+        notify('error', 'Trag zuerst Token und Repository ein.');
+        focusSettingsToken();
+        return;
+      }
+      const rel = latestRelease;
+      if (!confirm(`Update auf Version ${rel.version} einspielen?\n\nErsetzt werden nur die Dateien im Hauptordner deiner Kopie (App, Starter, Anleitung). Deine Ordner, Dateien und Planer-Daten bleiben unberührt.`)) return;
+
+      updateRunning = true;
+      try {
+        if (document.getElementById('updateBackupFirst').checked) exportFullBackup();
+        await savePreUpdateSnapshot(rel.tag);
+        renderUpdateUI('running', `Lade Version ${rel.version} aus der Vorlage …`);
+        const files = await fetchTemplateRootFiles(rel.tag);
+        renderUpdateUI('running', 'Schreibe das Update in deine Kopie …');
+        const result = await commitFilesToOwnRepo(files, `Update Cockpit auf Version ${rel.version}`);
+        renderUpdateUI('done', (result.unchanged
+          ? `Deine Kopie hat Version ${rel.version} schon.`
+          : `Version ${rel.version} ist in deiner Kopie.`)
+          + ' Schließ das Cockpit jetzt und starte es über das Desktop-Icon neu, dann wird sie geladen. Deine anderen Geräte holen sich das Update bei ihrem nächsten Start.');
+        notify('success', html`Update auf Version <strong>${rel.version}</strong> eingespielt – bitte das Cockpit neu starten.`);
+      } catch(e) {
+        console.warn('[Update] fehlgeschlagen:', e);
+        // Der Commit ist der letzte Schritt - scheitert vorher etwas, ist die
+        // Kopie unveraendert (hochgeladene Blobs ohne Commit sind wirkungslos).
+        renderUpdateUI('error', 'Update fehlgeschlagen, deine Kopie ist unverändert: ' + updateErrorText(e));
+      } finally {
+        updateRunning = false;
+      }
+    }
+
+    window.openUpdateSettings = function() {
+      switchSettingsTab('github');
+      document.getElementById('settingsModal').classList.add('open');
+      renderUpdateUI(updateAvailable() ? 'available' : 'idle');
+      setTimeout(() => {
+        const el = document.getElementById('updateSection');
+        if (el) el.scrollIntoView({ block: 'nearest' });
+      }, 60);
+    };
+    document.getElementById('btnHeaderUpdate').addEventListener('click', window.openUpdateSettings);
+    document.getElementById('btnCheckUpdate').addEventListener('click', () => checkForUpdate(true));
+    document.getElementById('btnRunUpdate').addEventListener('click', runAppUpdate);
 
     function blobToBase64(blob) {
       return new Promise((resolve, reject) => {
@@ -13253,6 +13552,9 @@ Einträge der Woche KW ${kw} (${yr} • ${dates.fullRange} • ${weekNumStr}):\n
       } else {
         updateCloudSyncUI('no-token');
       }
+
+      // App-Update: letzten Stand anzeigen, hoechstens einmal am Tag leise pruefen
+      scheduleQuietUpdateCheck();
 
       // Basis-Snapshot sicherstellen, damit sofort eine lokale Sicherung existiert
       if (recovered) {
