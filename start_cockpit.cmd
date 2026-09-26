@@ -51,6 +51,12 @@ if %ERRORLEVEL% EQU 0 (
     )
 )
 
+:: --- 0b. Desktop-Icon beim ersten Start anlegen ---------------------------
+::  Nur wenn noch keins existiert - ein bewusst geloeschtes oder angepasstes
+::  Icon wird nicht angefasst. Es zeigt auf diesen Starter und NICHT auf
+::  dropzone.html: ueber file:// waere das Cockpit kein Secure Context.
+powershell -NoProfile -Command "$lnk = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Ausbildungs-Cockpit.lnk'; if (-not (Test-Path $lnk)) { try { $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk); $sc.TargetPath = (Resolve-Path 'start_cockpit.cmd').Path; $sc.WorkingDirectory = (Get-Location).Path; $sc.IconLocation = (Resolve-Path 'app.ico').Path + ',0'; $sc.Description = 'Ausbildungs-Cockpit starten'; $sc.WindowStyle = 7; $sc.Save(); Write-Output '  [OK] Desktop-Icon angelegt.' } catch { Write-Output '  [HINWEIS] Desktop-Icon konnte nicht angelegt werden.' } }"
+
 :: --- 1. Laeuft BEREITS UNSER Server? -------------------------------------
 ::  Nicht nur "ist der Port belegt?" pruefen: haelt ihn ein fremder Prozess,
 ::  wuerde Edge fremden Inhalt unter unserem Origin laden. Deshalb wird gegen

@@ -16,13 +16,13 @@
 
 // v3: Archivdateien werden nicht mehr gecacht - alte Cache-Eintraege mit
 // veralteten KW-Dateien fallen beim Aktivieren weg.
-const CACHE_VERSION = 'v3';
+// v4: Manifest und app.png entfernt (keine Browser-Installation mehr, der
+// Starter oeffnet das App-Fenster selbst).
+const CACHE_VERSION = 'v4';
 const CACHE_NAME = 'cockpit-cache-' + CACHE_VERSION;
 const CORE_ASSETS = [
   './',
   './dropzone.html',
-  './manifest.webmanifest',
-  './app.png',
   './app.ico'
 ];
 

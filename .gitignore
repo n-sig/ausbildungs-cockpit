@@ -55,6 +55,4 @@ ausbildungs_cockpit_backup_*.json
 03_Betrieb_Notizen/*
 04_Assets_Screenshots/*
 05_Transfer_Inbox/*
-!*/README.md
-!*/.gitkeep
-!01_Berichtsheft/Ausbildungsjahr_1/DEMO_KW01_2026.md
+!**/.gitkeep

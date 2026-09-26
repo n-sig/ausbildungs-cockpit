@@ -1,51 +1,33 @@
-# 🤖 Ausbildungs-Cockpit
+# Ausbildungs-Cockpit
 
-> **Deine autarke Ausbildungs-Zentrale** – Berichtsheft, Berufsschulnotizen, Praxis-Dokumentation und nahtloser Smartphone-Upload. Privat, werbefrei, ohne fremde Server.
+Wochenplaner, Berichtsheft, Arbeitszeit und Dateiablage für die Ausbildung. Eine HTML-Datei, die lokal in deinem Browser läuft – ohne fremde Server.
 
----
+## Einrichten
 
-## 🚀 In 3 Schritten startklar
+1. **Eigene Kopie anlegen:** oben rechts **Use this template → Create a new repository**, Sichtbarkeit **Private**.
+2. **Git und Python installieren.** Bei Python den Haken **Add python.exe to PATH** setzen.
+3. **Klonen**, nicht in einen OneDrive-Ordner:
+   ```powershell
+   git clone https://github.com/benutzername/ausbildung.git "$HOME/ausbildung"
+   ```
+4. **Token erstellen:** GitHub → Settings → Developer settings → Fine-grained tokens. Nur deine Kopie, Berechtigung `Contents: Read and write`.
+5. **Starten:** `start_cockpit.cmd` doppelklicken. Beim ersten Start legt er ein Desktop-Icon an, ab dann startest du darüber.
+6. **Einrichtungsassistent ausfüllen:** in Schritt 4 Repository und Token eintragen, mit **Fertig** abschließen.
 
-### 1. Eigene private Kopie anlegen (30 Sek.)
-1. Klicke oben rechts auf **„Use this template“** → **„Create a new repository“**.
-2. Wähle einen Namen (z. B. `ausbildung`).
-3. **Wichtig:** Wähle als Sichtbarkeit unbedingt **🔒 Private**, damit deine betrieblichen Notizen und Berichte geschützt bleiben.
+**Weitere Rechner:** dort die Schritte 2 bis 6 mit einem eigenen Token wiederholen, im Assistenten dieselben Werte eintragen. Danach auf allen Rechnern ⚙️ Einstellungen → **Entwurf Auto-Sync** einschalten.
 
-### 2. Starten (1 Klick)
-Klone dein neues Repository auf deinen Rechner (oder lade es unter **Code → Download ZIP** herunter und entpacke es):
-* **Desktop-Icon anlegen:** Führe einmalig `create_desktop_icon.bat` aus – das legt dir eine direkte Verknüpfung auf deinen Desktop.
-* **Oder direkt starten:** Doppelklicke auf `start_cockpit.cmd`.
+## Ordner
 
-*Hinweis: Das Cockpit öffnet sich automatisch als native App in deinem Browser (Edge, Brave oder Chrome). Ein installiertes Python genügt.*
-
-### 3. Mit deinem Repository verbinden (1 Min.)
-Beim ersten Start öffnet sich das Cockpit. Trage unter **⚙️ Einstellungen → GitHub** deine Daten ein:
-1. Erstelle auf GitHub einen persönlichen Token:  
-   **GitHub → Settings → Developer Settings → Personal access tokens → Fine-grained tokens**  
-   *(Berechtigung: Repository access = dein Ausbildungs-Repository, Repository permissions = `Contents: Read and write`)*.
-2. Trage deinen Token und deinen Repository-Namen (`benutzername/ausbildung`) ein.
-
-**Fertig!** Dein Cockpit ist einsatzbereit.
-
----
-
-## 📁 Ordnerstruktur im Überblick
-
-Das Repository ist bereits optimal für deine Ausbildung vorstrukturiert:
-
-| Ordner | Zweck |
+| Ordner | Inhalt |
 |---|---|
-| `00_Templates/` | Vorlagen für wöchentliche Berichte und strukturierte Notizen |
-| `01_Berichtsheft/` | Deine wöchentlichen Ausbildungsnachweise (nach Ausbildungsjahren sortiert) |
-| `02_Berufsschule/` | Mitschriften, Lernfelder, Klausurvorbereitung und Tafelbilder |
-| `03_Betrieb_Notizen/` | Arbeitsplatz-Dokumentationen, Projekte und Praxishinweise |
-| `04_Assets_Screenshots/` | Belege, Bilder und Anhänge |
-| `05_Transfer_Inbox/` | **Smartphone-Ablage:** Fotos, Scans und Sprachnotizen vom Handy |
+| `01_Berichtsheft/` | Wochenberichte, legt das Cockpit selbst an |
+| `02_Berufsschule/` | Mitschriften und Lernfelder |
+| `03_Betrieb_Notizen/` | Praxiswissen und How-tos |
+| `04_Assets_Screenshots/` | Bilder und Screenshots, Ziel für Strg+V |
+| `05_Transfer_Inbox/` | Ablage vom Handy oder von anderen Geräten |
 
----
+## Gut zu wissen
 
-## 🔄 Wie deine Daten synchronisiert werden
-
-* **Alles bleibt privat:** Dein GitHub-Token liegt ausschließlich im lokalen Speicher deines Browsers und wird niemals übertragen.
-* **Automatischer Abgleich:** Jedes Mal, wenn du `start_cockpit.cmd` (oder dein Desktop-Icon) anklickst, synchronisiert der Starter deine lokalen Dateien automatisch mit GitHub (`git pull`).
-* **Updates der Oberfläche:** Der Starter holt Änderungen nur per `git pull` aus *deinem* Repository – und nur, wenn du lokal nichts geändert hast. Eine neue Version von `dropzone.html` übernimmst du bewusst selbst aus dem [Original-Repository](https://github.com/n-sig/ausbildungs-cockpit). Ein automatischer Download ohne Prüfung wäre ein Einfallstor: die Datei läuft mit Zugriff auf deinen GitHub-Token.
+- Der Token bleibt im Browser des jeweiligen Geräts und wird nur an GitHub gesendet.
+- Der Starter holt bei jedem Start Änderungen aus deiner Kopie (`git pull`), aber nur, wenn du lokal nichts geändert hast.
+- Neue Versionen erscheinen als [Release im Original](https://github.com/n-sig/ausbildungs-cockpit/releases). Du übernimmst `dropzone.html`, `start_cockpit.cmd` und `sw.js` bewusst selbst. Ein automatischer Download wäre ein Einfallstor, denn die App arbeitet mit deinem Token.
